@@ -10,10 +10,17 @@ from typing import Dict, Any, Tuple
 
 import jax
 import jax.numpy as jnp
+from jax import lax
 import flax
 from flax.training import train_state, checkpoints
+from flax.jax_utils import replicate, unreplicate
 import optax
 import numpy as np
+
+# Device setup
+NUM_DEVICES = jax.local_device_count()
+print(f"JAX devices: {jax.devices()}")
+print(f"Number of devices: {NUM_DEVICES}")
 
 # Add parent directory to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -164,7 +171,7 @@ def compute_loss(
 
 
 @partial(jax.jit, static_argnums=(2, 3, 4))
-def train_step(
+def train_step_single(
     state: TrainState,
     batch: Dict[str, jnp.ndarray],
     aux_use_waypoint_loss: bool,
@@ -172,8 +179,8 @@ def train_step(
     waypoint_loss_weight: float,
     rng: jax.random.PRNGKey,
 ) -> Tuple[TrainState, Dict[str, jnp.ndarray]]:
-    """Single training step."""
-    
+    """Single training step (single device)."""
+
     def loss_fn(params):
         return compute_loss(
             params,
@@ -185,11 +192,65 @@ def train_step(
             rng,
             deterministic=False,
         )
-    
+
     (loss, metrics), grads = jax.value_and_grad(loss_fn, has_aux=True)(state.params)
     state = state.apply_gradients(grads=grads)
-    
+
     return state, metrics
+
+
+def train_step_parallel(
+    state: TrainState,
+    batch: Dict[str, jnp.ndarray],
+    aux_use_waypoint_loss: bool,
+    aux_deep_supervision: bool,
+    waypoint_loss_weight: float,
+    rng: jax.random.PRNGKey,
+) -> Tuple[TrainState, Dict[str, jnp.ndarray]]:
+    """Single training step with gradient sync across devices."""
+
+    def loss_fn(params):
+        return compute_loss(
+            params,
+            state.apply_fn,
+            batch,
+            aux_use_waypoint_loss,
+            aux_deep_supervision,
+            waypoint_loss_weight,
+            rng,
+            deterministic=False,
+        )
+
+    (loss, metrics), grads = jax.value_and_grad(loss_fn, has_aux=True)(state.params)
+
+    # Average gradients across devices
+    grads = lax.pmean(grads, axis_name="batch")
+    metrics = lax.pmean(metrics, axis_name="batch")
+
+    state = state.apply_gradients(grads=grads)
+
+    return state, metrics
+
+
+def create_train_step_pmap(aux_use_waypoint_loss, aux_deep_supervision, waypoint_loss_weight):
+    """Create pmap'd train step with specific aux config."""
+    def _train_step(state, batch, rng):
+        return train_step_parallel(
+            state, batch,
+            aux_use_waypoint_loss, aux_deep_supervision, waypoint_loss_weight,
+            rng
+        )
+    return jax.pmap(_train_step, axis_name="batch")
+
+
+def shard_batch(batch: Dict[str, jnp.ndarray], num_devices: int) -> Dict[str, jnp.ndarray]:
+    """Shard batch across devices. Shape: (batch,) -> (devices, batch//devices, ...)"""
+    def _shard(x):
+        # Reshape to (num_devices, batch_per_device, ...)
+        batch_size = x.shape[0]
+        batch_per_device = batch_size // num_devices
+        return x[:num_devices * batch_per_device].reshape((num_devices, batch_per_device) + x.shape[1:])
+    return {k: _shard(v) for k, v in batch.items()}
 
 
 @partial(jax.jit, static_argnums=(2, 3, 4))
@@ -315,11 +376,21 @@ def evaluate_policy(
 
 
 def train(config: Config):
-    """Main training loop."""
-    
+    """Main training loop with multi-GPU support."""
+
     # Set random seed
     np.random.seed(config.training.seed)
     rng = jax.random.PRNGKey(config.training.seed)
+
+    # Multi-GPU setup
+    use_multi_gpu = NUM_DEVICES > 1
+    if use_multi_gpu:
+        print(f"\n=== Multi-GPU Training Enabled ({NUM_DEVICES} devices) ===")
+        # Ensure batch size is divisible by number of devices
+        if config.training.batch_size % NUM_DEVICES != 0:
+            old_batch_size = config.training.batch_size
+            config.training.batch_size = (config.training.batch_size // NUM_DEVICES) * NUM_DEVICES
+            print(f"Adjusted batch_size: {old_batch_size} -> {config.training.batch_size} (divisible by {NUM_DEVICES})")
     
     # Create output directory
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -375,7 +446,19 @@ def train(config: Config):
         config.state_dim,
         config.action_dim,
     )
-    
+
+    # Multi-GPU: replicate state and create pmap'd train step
+    if use_multi_gpu:
+        state = replicate(state)
+        train_step_fn = create_train_step_pmap(
+            config.aux.use_waypoint_loss,
+            config.aux.deep_supervision,
+            config.aux.waypoint_loss_weight,
+        )
+        print(f"State replicated across {NUM_DEVICES} devices")
+    else:
+        train_step_fn = None  # Use train_step_single
+
     # Training loop
     print(f"\nStarting training for {config.training.max_steps} steps...")
     
@@ -387,21 +470,29 @@ def train(config: Config):
     
     for step in range(config.training.max_steps):
         rng, step_rng = jax.random.split(rng)
-        
+
         # Get batch
         batch = next(train_iter)
         batch = batch_to_jax(batch)
-        
-        # Train step
-        state, metrics = train_step(
-            state,
-            batch,
-            aux_use_waypoint_loss,
-            aux_deep_supervision,
-            waypoint_loss_weight,
-            step_rng,
-        )
-        
+
+        # Train step (multi-GPU or single GPU)
+        if use_multi_gpu:
+            # Shard batch and RNG across devices
+            batch = shard_batch(batch, NUM_DEVICES)
+            step_rngs = jax.random.split(step_rng, NUM_DEVICES)
+            state, metrics = train_step_fn(state, batch, step_rngs)
+            # Get metrics from first device (they're averaged via pmean)
+            metrics = {k: v[0] for k, v in metrics.items()}
+        else:
+            state, metrics = train_step_single(
+                state,
+                batch,
+                aux_use_waypoint_loss,
+                aux_deep_supervision,
+                waypoint_loss_weight,
+                step_rng,
+            )
+
         # Logging
         if step % config.training.log_every == 0:
             metrics_np = {k: float(v) for k, v in metrics.items()}
@@ -410,12 +501,15 @@ def train(config: Config):
         # Evaluation
         if step > 0 and step % config.training.eval_every == 0:
             print(f"\nEvaluating at step {step}...")
-            
+
+            # Get unreplicated state for evaluation (multi-GPU)
+            eval_state = unreplicate(state) if use_multi_gpu else state
+
             # Validation loss
             val_batch = val_loader.get_batch()
             val_batch = batch_to_jax(val_batch)
             val_metrics = eval_step(
-                state,
+                eval_state,
                 val_batch,
                 aux_use_waypoint_loss,
                 aux_deep_supervision,
@@ -423,36 +517,37 @@ def train(config: Config):
             )
             val_metrics_np = {f"val_{k}": float(v) for k, v in val_metrics.items()}
             print("Validation: " + ", ".join(f"{k}={v:.4f}" for k, v in val_metrics_np.items()))
-            
+
             # Policy evaluation
             eval_metrics = evaluate_policy(
-                state,
+                eval_state,
                 env_info["env"],
                 config,
                 num_episodes=config.training.eval_episodes,
             )
             print(f"Policy eval: success_rate={eval_metrics['success_rate']:.3f}, "
                   f"avg_steps={eval_metrics['avg_steps']:.1f}")
-            
-            # Save best model
+
+            # Save best model (use unreplicated state)
             if eval_metrics["success_rate"] > best_success_rate:
                 best_success_rate = eval_metrics["success_rate"]
                 checkpoints.save_checkpoint(
                     output_dir,
-                    state,
+                    eval_state,
                     step,
                     prefix="best_",
                     keep=1,
                 )
                 print(f"New best model saved! Success rate: {best_success_rate:.3f}")
-            
+
             print()
-        
-        # Save checkpoint
+
+        # Save checkpoint (use unreplicated state for multi-GPU)
         if step > 0 and step % config.training.save_every == 0:
+            save_state = unreplicate(state) if use_multi_gpu else state
             checkpoints.save_checkpoint(
                 output_dir,
-                state,
+                save_state,
                 step,
                 keep=3,
             )
