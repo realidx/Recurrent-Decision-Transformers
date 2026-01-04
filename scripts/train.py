@@ -4,6 +4,7 @@ import os
 import sys
 import time
 import json
+import dataclasses
 from datetime import datetime
 from functools import partial
 from typing import Dict, Any, Tuple
@@ -313,7 +314,8 @@ def evaluate_policy(
 
                 states_arr = np.array(states_buffer)
                 if actions_buffer:
-                    actions_seq = np.array(actions_buffer + [actions_buffer[-1]])
+                    actions_arr = np.array(actions_buffer)
+                    actions_seq = np.concatenate([actions_arr, np.zeros((1, action_dim))], axis=0)
                     pad_action = np.array(actions_buffer[0])
                 else:
                     actions_seq = np.zeros((1, action_dim))
@@ -401,8 +403,14 @@ def train(config: Config):
     os.makedirs(output_dir, exist_ok=True)
     
     # Save config
+    def config_to_dict(value):
+        """Recursively convert dataclasses to dicts for JSON serialization."""
+        if dataclasses.is_dataclass(value):
+            return {k: config_to_dict(v) for k, v in dataclasses.asdict(value).items()}
+        return value
+
     with open(os.path.join(output_dir, "config.json"), "w") as f:
-        json.dump(config.__dict__, f, indent=2, default=str)
+        json.dump(config_to_dict(config), f, indent=2)
     
     print(f"Output directory: {output_dir}")
     print(f"Loading dataset: {config.data.dataset_name}")

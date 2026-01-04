@@ -42,6 +42,8 @@ class UTGCDT(nn.Module):
     
     # Plan token
     use_plan_token: bool = True
+    plan_token_bidirectional: bool = False
+    plan_token_block_last_action: bool = True
     
     # Sequence config
     max_seq_len: int = 256
@@ -139,6 +141,27 @@ class UTGCDT(nn.Module):
         # Embed tokens
         hidden, plan_token_idx = self.token_embed(states, actions, goals, timesteps)
         total_seq_len = hidden.shape[1]
+        plan_offset = 1 if self.use_plan_token else 0
+
+        attn_mask = None
+        if self.use_plan_token and self.plan_token_bidirectional:
+            attn_mask = jnp.tril(jnp.ones((total_seq_len, total_seq_len)))
+            attn_mask = attn_mask.at[0, :].set(1)
+            if self.plan_token_block_last_action:
+                last_action_idx = plan_offset + 2 * seq_len
+                attn_mask = attn_mask.at[0, last_action_idx].set(0)
+            attn_mask = attn_mask[None, None, :, :]
+        total_seq_len = hidden.shape[1]
+        plan_offset = 1 if self.use_plan_token else 0
+
+        attn_mask = None
+        if self.use_plan_token and self.plan_token_bidirectional:
+            attn_mask = jnp.tril(jnp.ones((total_seq_len, total_seq_len)))
+            attn_mask = attn_mask.at[0, :].set(1)
+            if self.plan_token_block_last_action:
+                last_action_idx = plan_offset + 2 * seq_len
+                attn_mask = attn_mask.at[0, last_action_idx].set(0)
+            attn_mask = attn_mask[None, None, :, :]
         
         # Store intermediate outputs for deep supervision
         waypoint_preds = []
@@ -153,6 +176,7 @@ class UTGCDT(nn.Module):
             # Apply transformer block (same weights each iteration)
             hidden = self.transformer_block(
                 hidden_with_step,
+                mask=attn_mask,
                 deterministic=deterministic
             )
             
@@ -171,7 +195,6 @@ class UTGCDT(nn.Module):
         # Get the hidden state for the last state token to predict action
         # Sequence: [PLAN] [GOAL] s_0 a_0 s_1 a_1 ... s_t a_t
         # Last state token is at position: plan_offset + 1 + 2*seq_len - 2 = plan_offset + 2*seq_len - 1
-        plan_offset = 1 if self.use_plan_token else 0
         last_state_idx = plan_offset + 1 + 2 * (seq_len - 1)  # index of s_t
         
         last_state_hidden = hidden[:, last_state_idx, :]  # (batch, hidden_dim)
@@ -207,6 +230,8 @@ class GCDT(nn.Module):
     
     # Plan token (for fair comparison)
     use_plan_token: bool = False
+    plan_token_bidirectional: bool = False
+    plan_token_block_last_action: bool = True
     
     # Sequence config
     max_seq_len: int = 256
@@ -260,13 +285,12 @@ class GCDT(nn.Module):
         
         # Apply transformer layers sequentially (different weights each layer)
         for layer in self.transformer_layers:
-            hidden = layer(hidden, deterministic=deterministic)
+            hidden = layer(hidden, mask=attn_mask, deterministic=deterministic)
         
         # Final layer norm
         hidden = self.final_ln(hidden)
         
         # Get hidden state for last state token
-        plan_offset = 1 if self.use_plan_token else 0
         last_state_idx = plan_offset + 1 + 2 * (seq_len - 1)
         last_state_hidden = hidden[:, last_state_idx, :]
         
@@ -294,6 +318,8 @@ def create_model(config) -> nn.Module:
             use_step_embeddings=config.model.use_step_embeddings,
             step_embedding_type=config.model.step_embedding_type,
             use_plan_token=config.model.use_plan_token,
+            plan_token_bidirectional=config.model.plan_token_bidirectional,
+            plan_token_block_last_action=config.model.plan_token_block_last_action,
             max_seq_len=config.model.max_seq_len,
             use_waypoint_head=config.aux.use_waypoint_loss,
         )
@@ -307,5 +333,7 @@ def create_model(config) -> nn.Module:
             mlp_ratio=config.model.mlp_ratio,
             dropout_rate=config.model.dropout_rate,
             use_plan_token=config.model.use_plan_token,
+            plan_token_bidirectional=config.model.plan_token_bidirectional,
+            plan_token_block_last_action=config.model.plan_token_block_last_action,
             max_seq_len=config.model.max_seq_len,
         )

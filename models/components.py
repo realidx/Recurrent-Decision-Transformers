@@ -166,14 +166,11 @@ class MultiHeadAttention(nn.Module):
         scale = head_dim ** -0.5
         attn = jnp.einsum("bhid,bhjd->bhij", q, k) * scale
         
-        # Causal mask
-        causal_mask = jnp.tril(jnp.ones((seq_len, seq_len)))
-        causal_mask = causal_mask[None, None, :, :]  # (1, 1, seq_len, seq_len)
-        attn = jnp.where(causal_mask == 0, -1e9, attn)
-        
-        # Additional mask if provided
-        if mask is not None:
-            attn = jnp.where(mask == 0, -1e9, attn)
+        # Use caller-provided mask if given; otherwise default to causal.
+        if mask is None:
+            mask = jnp.tril(jnp.ones((seq_len, seq_len)))
+            mask = mask[None, None, :, :]  # (1, 1, seq_len, seq_len)
+        attn = jnp.where(mask == 0, -1e9, attn)
         
         attn = jax.nn.softmax(attn, axis=-1)
         attn = nn.Dropout(rate=self.dropout_rate)(attn, deterministic=deterministic)

@@ -29,6 +29,8 @@ class ModelConfig:
     
     # Plan token
     use_plan_token: bool = True
+    plan_token_bidirectional: bool = False
+    plan_token_block_last_action: bool = True
     
     # Sequence modeling
     max_seq_len: int = 256  # Maximum context length
