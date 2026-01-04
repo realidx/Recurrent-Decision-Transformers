@@ -1,6 +1,10 @@
 # Core dependencies
+# For GPU support, install JAX with CUDA:
+#   pip install -U "jax[cuda12]"          # CUDA 12.x (recommended)
+#   pip install -U "jax[cuda11_pip]"      # CUDA 11.x
+# For CPU only:
+#   pip install jax jaxlib
 jax>=0.4.20
-jaxlib>=0.4.20
 flax>=0.8.0
 optax>=0.1.7
 
