@@ -1,0 +1,35 @@
+# Data files (too large for git)
+ogbench_data/
+*.npz
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Virtual environments
+venv/
+env/
+.venv/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Outputs (optional - uncomment if you don't want to track)
+# outputs/
+
+# JAX/Flax
+*.msgpack
