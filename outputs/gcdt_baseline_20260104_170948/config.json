@@ -1,0 +1,9 @@
+{
+  "exp_name": "gcdt_baseline",
+  "model": "ModelConfig(hidden_dim=256, num_heads=4, mlp_ratio=4.0, dropout_rate=0.1, num_layers=4, num_iterations=4, use_weight_tying=False, use_step_embeddings=False, step_embedding_type='learned', use_plan_token=False, max_seq_len=256)",
+  "aux": "AuxiliaryConfig(use_waypoint_loss=False, waypoint_horizon=10, waypoint_loss_weight=0.1, deep_supervision=True)",
+  "training": "TrainingConfig(learning_rate=0.0001, weight_decay=0.1, warmup_steps=1000, max_steps=100000, batch_size=256, context_len=20, eval_every=5000, eval_episodes=100, log_every=100, save_every=10000, seed=42)",
+  "data": "DataConfig(dataset_name='antmaze-medium-stitch-v0', dataset_dir='./ogbench_data', goal_sampling='future', min_goal_horizon=1, max_goal_horizon=50)",
+  "eval": "EvalConfig(test_iterations=[4, 6, 8], goal_distance_buckets=[10, 25, 50, 100])",
+  "output_dir": "./outputs"
+}

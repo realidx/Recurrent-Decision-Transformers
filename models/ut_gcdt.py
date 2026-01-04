@@ -1,0 +1,311 @@
+"""Universal Transformer Goal-Conditioned Decision Transformer (UT-GCDT)."""
+
+import jax
+import jax.numpy as jnp
+import flax.linen as nn
+from typing import Optional, Tuple, Dict, Any
+from functools import partial
+
+from .components import (
+    TokenEmbedding,
+    TransformerBlock,
+    SinusoidalEmbedding,
+    ActionHead,
+    WaypointHead,
+)
+
+
+class UTGCDT(nn.Module):
+    """
+    Universal Transformer for Goal-Conditioned Decision Transformers.
+    
+    Key features:
+    - Weight-tied transformer block applied K times (Universal Transformer style)
+    - Optional plan token for iterative refinement
+    - Step embeddings to distinguish iterations
+    - Waypoint auxiliary loss for deep supervision
+    """
+    # Dimensions
+    state_dim: int
+    action_dim: int
+    hidden_dim: int = 256
+    
+    # Transformer config
+    num_heads: int = 4
+    mlp_ratio: float = 4.0
+    dropout_rate: float = 0.1
+    
+    # UT config
+    num_iterations: int = 4  # K: number of times to apply transformer block
+    use_step_embeddings: bool = True
+    step_embedding_type: str = "learned"  # "learned" or "sinusoidal"
+    
+    # Plan token
+    use_plan_token: bool = True
+    
+    # Sequence config
+    max_seq_len: int = 256
+    
+    # Auxiliary heads
+    use_waypoint_head: bool = True
+    
+    def setup(self):
+        # Token embeddings
+        self.token_embed = TokenEmbedding(
+            hidden_dim=self.hidden_dim,
+            max_seq_len=self.max_seq_len,
+            state_dim=self.state_dim,
+            action_dim=self.action_dim,
+            use_plan_token=self.use_plan_token,
+        )
+        
+        # Single transformer block (weight-tied across iterations)
+        self.transformer_block = TransformerBlock(
+            num_heads=self.num_heads,
+            hidden_dim=self.hidden_dim,
+            mlp_ratio=self.mlp_ratio,
+            dropout_rate=self.dropout_rate,
+        )
+        
+        # Step embeddings for each iteration
+        if self.use_step_embeddings:
+            if self.step_embedding_type == "sinusoidal":
+                self.step_embed = SinusoidalEmbedding(dim=self.hidden_dim)
+            else:
+                # Learned step embeddings
+                self.step_embeddings = self.param(
+                    "step_embeddings",
+                    nn.initializers.normal(stddev=0.02),
+                    (self.num_iterations, self.hidden_dim),
+                )
+        
+        # Final layer norm
+        self.final_ln = nn.LayerNorm()
+        
+        # Prediction heads
+        self.action_head = ActionHead(
+            action_dim=self.action_dim,
+            hidden_dim=self.hidden_dim,
+        )
+        
+        if self.use_waypoint_head:
+            self.waypoint_head = WaypointHead(
+                state_dim=self.state_dim,
+                hidden_dim=self.hidden_dim,
+            )
+    
+    def get_step_embedding(self, step: int, batch_size: int, seq_len: int) -> jnp.ndarray:
+        """Get step embedding for iteration k."""
+        if not self.use_step_embeddings:
+            return jnp.zeros((batch_size, seq_len, self.hidden_dim))
+        
+        if self.step_embedding_type == "sinusoidal":
+            # Same step for all positions in sequence
+            steps = jnp.full((batch_size,), step)
+            step_emb = self.step_embed(steps)  # (batch, hidden_dim)
+            step_emb = step_emb[:, None, :]  # (batch, 1, hidden_dim)
+            step_emb = jnp.broadcast_to(step_emb, (batch_size, seq_len, self.hidden_dim))
+        else:
+            # Learned step embeddings
+            step_emb = self.step_embeddings[step]  # (hidden_dim,)
+            step_emb = jnp.broadcast_to(step_emb, (batch_size, seq_len, self.hidden_dim))
+        
+        return step_emb
+    
+    @nn.compact
+    def __call__(
+        self,
+        states: jnp.ndarray,      # (batch, seq_len, state_dim)
+        actions: jnp.ndarray,     # (batch, seq_len, action_dim)
+        goals: jnp.ndarray,       # (batch, state_dim)
+        timesteps: jnp.ndarray,   # (batch, seq_len)
+        num_iterations: Optional[int] = None,  # Override for test-time scaling
+        deterministic: bool = True,
+        return_intermediates: bool = False,  # Return intermediate states for deep supervision
+    ) -> Dict[str, Any]:
+        """
+        Forward pass with K iterations of the transformer block.
+        
+        Returns:
+            Dictionary containing:
+            - action_pred: Predicted action (batch, action_dim)
+            - waypoint_preds: List of waypoint predictions at each iteration
+            - plan_states: List of plan token states at each iteration
+            - hidden_states: Final hidden states (batch, seq_len, hidden_dim)
+        """
+        batch_size, seq_len, _ = states.shape
+        K = num_iterations if num_iterations is not None else self.num_iterations
+        
+        # Embed tokens
+        hidden, plan_token_idx = self.token_embed(states, actions, goals, timesteps)
+        total_seq_len = hidden.shape[1]
+        
+        # Store intermediate outputs for deep supervision
+        waypoint_preds = []
+        plan_states = []
+        
+        # Apply transformer block K times (Universal Transformer loop)
+        for k in range(K):
+            # Add step embedding
+            step_emb = self.get_step_embedding(k, batch_size, total_seq_len)
+            hidden_with_step = hidden + step_emb
+            
+            # Apply transformer block (same weights each iteration)
+            hidden = self.transformer_block(
+                hidden_with_step,
+                deterministic=deterministic
+            )
+            
+            # Extract plan token state and predict waypoint (for deep supervision)
+            if self.use_plan_token and self.use_waypoint_head:
+                plan_state = hidden[:, plan_token_idx, :]  # (batch, hidden_dim)
+                plan_states.append(plan_state)
+                
+                if return_intermediates or k == K - 1:
+                    waypoint_pred = self.waypoint_head(plan_state)
+                    waypoint_preds.append(waypoint_pred)
+        
+        # Final layer norm
+        hidden = self.final_ln(hidden)
+        
+        # Get the hidden state for the last state token to predict action
+        # Sequence: [PLAN] [GOAL] s_0 a_0 s_1 a_1 ... s_t a_t
+        # Last state token is at position: plan_offset + 1 + 2*seq_len - 2 = plan_offset + 2*seq_len - 1
+        plan_offset = 1 if self.use_plan_token else 0
+        last_state_idx = plan_offset + 1 + 2 * (seq_len - 1)  # index of s_t
+        
+        last_state_hidden = hidden[:, last_state_idx, :]  # (batch, hidden_dim)
+        
+        # Predict action
+        action_pred = self.action_head(last_state_hidden)
+        
+        return {
+            "action_pred": action_pred,
+            "waypoint_preds": waypoint_preds,
+            "plan_states": plan_states,
+            "hidden_states": hidden,
+            "plan_token_idx": plan_token_idx,
+        }
+
+
+class GCDT(nn.Module):
+    """
+    Standard Goal-Conditioned Decision Transformer (baseline).
+    
+    Uses stacked transformer layers with untied weights.
+    """
+    # Dimensions
+    state_dim: int
+    action_dim: int
+    hidden_dim: int = 256
+    
+    # Transformer config
+    num_heads: int = 4
+    num_layers: int = 4  # L: number of stacked layers
+    mlp_ratio: float = 4.0
+    dropout_rate: float = 0.1
+    
+    # Plan token (for fair comparison)
+    use_plan_token: bool = False
+    
+    # Sequence config
+    max_seq_len: int = 256
+    
+    def setup(self):
+        # Token embeddings
+        self.token_embed = TokenEmbedding(
+            hidden_dim=self.hidden_dim,
+            max_seq_len=self.max_seq_len,
+            state_dim=self.state_dim,
+            action_dim=self.action_dim,
+            use_plan_token=self.use_plan_token,
+        )
+        
+        # Stacked transformer layers (untied weights)
+        self.transformer_layers = [
+            TransformerBlock(
+                num_heads=self.num_heads,
+                hidden_dim=self.hidden_dim,
+                mlp_ratio=self.mlp_ratio,
+                dropout_rate=self.dropout_rate,
+                name=f"layer_{i}"
+            )
+            for i in range(self.num_layers)
+        ]
+        
+        # Final layer norm
+        self.final_ln = nn.LayerNorm()
+        
+        # Prediction head
+        self.action_head = ActionHead(
+            action_dim=self.action_dim,
+            hidden_dim=self.hidden_dim,
+        )
+    
+    @nn.compact
+    def __call__(
+        self,
+        states: jnp.ndarray,
+        actions: jnp.ndarray,
+        goals: jnp.ndarray,
+        timesteps: jnp.ndarray,
+        deterministic: bool = True,
+        return_intermediates: bool = False,  # Unused, for API compatibility with UTGCDT
+    ) -> Dict[str, Any]:
+        """Forward pass through stacked transformer layers."""
+        batch_size, seq_len, _ = states.shape
+        
+        # Embed tokens
+        hidden, plan_token_idx = self.token_embed(states, actions, goals, timesteps)
+        
+        # Apply transformer layers sequentially (different weights each layer)
+        for layer in self.transformer_layers:
+            hidden = layer(hidden, deterministic=deterministic)
+        
+        # Final layer norm
+        hidden = self.final_ln(hidden)
+        
+        # Get hidden state for last state token
+        plan_offset = 1 if self.use_plan_token else 0
+        last_state_idx = plan_offset + 1 + 2 * (seq_len - 1)
+        last_state_hidden = hidden[:, last_state_idx, :]
+        
+        # Predict action
+        action_pred = self.action_head(last_state_hidden)
+        
+        return {
+            "action_pred": action_pred,
+            "hidden_states": hidden,
+            "plan_token_idx": plan_token_idx,
+        }
+
+
+def create_model(config) -> nn.Module:
+    """Factory function to create model from config."""
+    if config.model.use_weight_tying:
+        return UTGCDT(
+            state_dim=config.state_dim,
+            action_dim=config.action_dim,
+            hidden_dim=config.model.hidden_dim,
+            num_heads=config.model.num_heads,
+            mlp_ratio=config.model.mlp_ratio,
+            dropout_rate=config.model.dropout_rate,
+            num_iterations=config.model.num_iterations,
+            use_step_embeddings=config.model.use_step_embeddings,
+            step_embedding_type=config.model.step_embedding_type,
+            use_plan_token=config.model.use_plan_token,
+            max_seq_len=config.model.max_seq_len,
+            use_waypoint_head=config.aux.use_waypoint_loss,
+        )
+    else:
+        return GCDT(
+            state_dim=config.state_dim,
+            action_dim=config.action_dim,
+            hidden_dim=config.model.hidden_dim,
+            num_heads=config.model.num_heads,
+            num_layers=config.model.num_layers,
+            mlp_ratio=config.model.mlp_ratio,
+            dropout_rate=config.model.dropout_rate,
+            use_plan_token=config.model.use_plan_token,
+            max_seq_len=config.model.max_seq_len,
+        )

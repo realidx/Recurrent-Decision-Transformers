@@ -1,0 +1,285 @@
+"""Shared model components for GCDT and UT-GCDT."""
+
+import jax
+import jax.numpy as jnp
+import flax.linen as nn
+from typing import Optional, Tuple
+import math
+
+
+class SinusoidalEmbedding(nn.Module):
+    """Sinusoidal positional/step embeddings."""
+    dim: int
+    max_len: int = 1000
+    
+    @nn.compact
+    def __call__(self, positions: jnp.ndarray) -> jnp.ndarray:
+        """
+        Args:
+            positions: Integer positions of shape (batch, seq_len) or (batch,)
+        Returns:
+            Embeddings of shape (batch, seq_len, dim) or (batch, dim)
+        """
+        half_dim = self.dim // 2
+        emb_scale = math.log(10000) / (half_dim - 1)
+        emb = jnp.exp(jnp.arange(half_dim) * -emb_scale)
+        
+        # Handle both 1D and 2D position inputs
+        if positions.ndim == 1:
+            positions = positions[:, None]  # (batch, 1)
+            squeeze_output = True
+        else:
+            squeeze_output = False
+            
+        emb = positions[..., None] * emb[None, None, :]  # (batch, seq_len, half_dim)
+        emb = jnp.concatenate([jnp.sin(emb), jnp.cos(emb)], axis=-1)  # (batch, seq_len, dim)
+        
+        if squeeze_output:
+            emb = emb.squeeze(1)
+            
+        return emb
+
+
+class TokenEmbedding(nn.Module):
+    """Embedding layer for states, actions, and special tokens."""
+    hidden_dim: int
+    max_seq_len: int
+    state_dim: int
+    action_dim: int
+    use_plan_token: bool = True
+    
+    @nn.compact
+    def __call__(
+        self,
+        states: jnp.ndarray,      # (batch, seq_len, state_dim)
+        actions: jnp.ndarray,     # (batch, seq_len, action_dim)  
+        goals: jnp.ndarray,       # (batch, state_dim)
+        timesteps: jnp.ndarray,   # (batch, seq_len)
+    ) -> Tuple[jnp.ndarray, int]:
+        """
+        Embed and concatenate tokens into sequence.
+        
+        Returns:
+            embeddings: (batch, total_seq_len, hidden_dim)
+            plan_token_idx: Index of plan token in sequence (0 if used, -1 if not)
+        """
+        batch_size, seq_len, _ = states.shape
+        
+        # Project states, actions, goals to hidden_dim
+        state_embed = nn.Dense(self.hidden_dim, name="state_embed")(states)
+        action_embed = nn.Dense(self.hidden_dim, name="action_embed")(actions)
+        goal_embed = nn.Dense(self.hidden_dim, name="goal_embed")(goals)  # (batch, hidden_dim)
+        
+        # Positional embeddings
+        pos_embed = self.param(
+            "pos_embed",
+            nn.initializers.normal(stddev=0.02),
+            (1, self.max_seq_len, self.hidden_dim)
+        )
+        
+        # Token type embeddings (state=0, action=1, goal=2, plan=3)
+        token_type_embed = self.param(
+            "token_type_embed",
+            nn.initializers.normal(stddev=0.02),
+            (4, self.hidden_dim)
+        )
+        
+        # Build sequence: [PLAN] [GOAL] s_0 a_0 s_1 a_1 ... s_t a_t
+        # or without plan: [GOAL] s_0 a_0 s_1 a_1 ... s_t a_t
+        
+        tokens = []
+        token_types = []
+        
+        # Plan token (learnable)
+        if self.use_plan_token:
+            plan_token = self.param(
+                "plan_token",
+                nn.initializers.normal(stddev=0.02),
+                (1, 1, self.hidden_dim)
+            )
+            plan_token = jnp.broadcast_to(plan_token, (batch_size, 1, self.hidden_dim))
+            tokens.append(plan_token)
+            token_types.append(jnp.full((batch_size, 1), 3))  # type 3 = plan
+            plan_token_idx = 0
+        else:
+            plan_token_idx = -1
+            
+        # Goal token
+        goal_token = goal_embed[:, None, :]  # (batch, 1, hidden_dim)
+        tokens.append(goal_token)
+        token_types.append(jnp.full((batch_size, 1), 2))  # type 2 = goal
+        
+        # Interleave states and actions: s_0 a_0 s_1 a_1 ...
+        for t in range(seq_len):
+            tokens.append(state_embed[:, t:t+1, :])
+            token_types.append(jnp.full((batch_size, 1), 0))  # type 0 = state
+            tokens.append(action_embed[:, t:t+1, :])
+            token_types.append(jnp.full((batch_size, 1), 1))  # type 1 = action
+        
+        # Concatenate all tokens
+        embeddings = jnp.concatenate(tokens, axis=1)  # (batch, total_len, hidden_dim)
+        token_types = jnp.concatenate(token_types, axis=1)  # (batch, total_len)
+        
+        total_len = embeddings.shape[1]
+        
+        # Add positional embeddings
+        embeddings = embeddings + pos_embed[:, :total_len, :]
+        
+        # Add token type embeddings
+        type_embeds = token_type_embed[token_types]  # (batch, total_len, hidden_dim)
+        embeddings = embeddings + type_embeds
+        
+        return embeddings, plan_token_idx
+
+
+class MultiHeadAttention(nn.Module):
+    """Multi-head self-attention with causal masking."""
+    num_heads: int
+    hidden_dim: int
+    dropout_rate: float = 0.1
+    
+    @nn.compact
+    def __call__(
+        self,
+        x: jnp.ndarray,
+        mask: Optional[jnp.ndarray] = None,
+        deterministic: bool = True
+    ) -> jnp.ndarray:
+        """
+        Args:
+            x: Input of shape (batch, seq_len, hidden_dim)
+            mask: Optional attention mask (batch, 1, seq_len, seq_len)
+            deterministic: Whether to apply dropout
+        Returns:
+            Output of shape (batch, seq_len, hidden_dim)
+        """
+        batch_size, seq_len, _ = x.shape
+        head_dim = self.hidden_dim // self.num_heads
+        
+        # QKV projection
+        qkv = nn.Dense(3 * self.hidden_dim, name="qkv")(x)
+        qkv = qkv.reshape(batch_size, seq_len, 3, self.num_heads, head_dim)
+        qkv = qkv.transpose(2, 0, 3, 1, 4)  # (3, batch, heads, seq_len, head_dim)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+        
+        # Attention scores
+        scale = head_dim ** -0.5
+        attn = jnp.einsum("bhid,bhjd->bhij", q, k) * scale
+        
+        # Causal mask
+        causal_mask = jnp.tril(jnp.ones((seq_len, seq_len)))
+        causal_mask = causal_mask[None, None, :, :]  # (1, 1, seq_len, seq_len)
+        attn = jnp.where(causal_mask == 0, -1e9, attn)
+        
+        # Additional mask if provided
+        if mask is not None:
+            attn = jnp.where(mask == 0, -1e9, attn)
+        
+        attn = jax.nn.softmax(attn, axis=-1)
+        attn = nn.Dropout(rate=self.dropout_rate)(attn, deterministic=deterministic)
+        
+        # Attention output
+        out = jnp.einsum("bhij,bhjd->bhid", attn, v)
+        out = out.transpose(0, 2, 1, 3).reshape(batch_size, seq_len, self.hidden_dim)
+        
+        # Output projection
+        out = nn.Dense(self.hidden_dim, name="out_proj")(out)
+        out = nn.Dropout(rate=self.dropout_rate)(out, deterministic=deterministic)
+        
+        return out
+
+
+class FeedForward(nn.Module):
+    """Feed-forward network with GELU activation."""
+    hidden_dim: int
+    mlp_ratio: float = 4.0
+    dropout_rate: float = 0.1
+    
+    @nn.compact
+    def __call__(self, x: jnp.ndarray, deterministic: bool = True) -> jnp.ndarray:
+        mlp_dim = int(self.hidden_dim * self.mlp_ratio)
+        
+        x = nn.Dense(mlp_dim, name="fc1")(x)
+        x = nn.gelu(x)
+        x = nn.Dropout(rate=self.dropout_rate)(x, deterministic=deterministic)
+        x = nn.Dense(self.hidden_dim, name="fc2")(x)
+        x = nn.Dropout(rate=self.dropout_rate)(x, deterministic=deterministic)
+        
+        return x
+
+
+class TransformerBlock(nn.Module):
+    """Single transformer block (attention + FFN with pre-norm)."""
+    num_heads: int
+    hidden_dim: int
+    mlp_ratio: float = 4.0
+    dropout_rate: float = 0.1
+    
+    @nn.compact
+    def __call__(
+        self,
+        x: jnp.ndarray,
+        mask: Optional[jnp.ndarray] = None,
+        deterministic: bool = True
+    ) -> jnp.ndarray:
+        # Pre-norm attention
+        residual = x
+        x = nn.LayerNorm(name="ln1")(x)
+        x = MultiHeadAttention(
+            num_heads=self.num_heads,
+            hidden_dim=self.hidden_dim,
+            dropout_rate=self.dropout_rate,
+            name="attn"
+        )(x, mask=mask, deterministic=deterministic)
+        x = residual + x
+        
+        # Pre-norm FFN
+        residual = x
+        x = nn.LayerNorm(name="ln2")(x)
+        x = FeedForward(
+            hidden_dim=self.hidden_dim,
+            mlp_ratio=self.mlp_ratio,
+            dropout_rate=self.dropout_rate,
+            name="ffn"
+        )(x, deterministic=deterministic)
+        x = residual + x
+        
+        return x
+
+
+class ActionHead(nn.Module):
+    """Action prediction head."""
+    action_dim: int
+    hidden_dim: int
+    
+    @nn.compact
+    def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
+        """
+        Args:
+            x: Hidden state of shape (batch, hidden_dim)
+        Returns:
+            Action prediction of shape (batch, action_dim)
+        """
+        x = nn.Dense(self.hidden_dim, name="fc1")(x)
+        x = nn.gelu(x)
+        x = nn.Dense(self.action_dim, name="fc2")(x)
+        return x
+
+
+class WaypointHead(nn.Module):
+    """Waypoint (future state) prediction head."""
+    state_dim: int
+    hidden_dim: int
+    
+    @nn.compact
+    def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
+        """
+        Args:
+            x: Hidden state (e.g., plan token) of shape (batch, hidden_dim)
+        Returns:
+            Future state prediction of shape (batch, state_dim)
+        """
+        x = nn.Dense(self.hidden_dim, name="fc1")(x)
+        x = nn.gelu(x)
+        x = nn.Dense(self.state_dim, name="fc2")(x)
+        return x

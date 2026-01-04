@@ -1,0 +1,20 @@
+# Core dependencies
+jax>=0.4.20
+jaxlib>=0.4.20
+flax>=0.8.0
+optax>=0.1.7
+
+# OGBench
+ogbench>=0.1.0
+
+# Environment
+mujoco>=3.1.6
+dm_control>=1.0.20
+gymnasium>=0.29.0
+
+# Utilities
+numpy>=1.24.0
+tqdm>=4.65.0
+
+# Optional: for visualization
+matplotlib>=3.7.0
