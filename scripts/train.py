@@ -309,24 +309,27 @@ def evaluate_policy(
                 # Prepare input for model
                 # Pad context if needed
                 ctx_len = config.training.context_len
-                
-                if len(states_buffer) < ctx_len:
-                    # Pad with first observation
-                    pad_len = ctx_len - len(states_buffer)
-                    states = np.array([states_buffer[0]] * pad_len + states_buffer)
-                    if len(actions_buffer) == 0:
-                        actions = np.zeros((ctx_len, env.action_space.shape[0]))
-                    else:
-                        actions = np.array([actions_buffer[0]] * (pad_len + 1) + actions_buffer[:-1])
-                        actions = actions[-ctx_len:]
+                action_dim = env.action_space.shape[0]
+
+                states_arr = np.array(states_buffer)
+                if actions_buffer:
+                    actions_seq = np.array(actions_buffer + [actions_buffer[-1]])
+                    pad_action = np.array(actions_buffer[0])
                 else:
-                    states = np.array(states_buffer[-ctx_len:])
-                    actions = np.array(actions_buffer[-(ctx_len-1):] + [actions_buffer[-1]] if actions_buffer else [[0]*env.action_space.shape[0]])
-                    if len(actions) < ctx_len:
-                        actions = np.concatenate([
-                            np.zeros((ctx_len - len(actions), env.action_space.shape[0])),
-                            actions
-                        ])
+                    actions_seq = np.zeros((1, action_dim))
+                    pad_action = np.zeros(action_dim)
+
+                if len(states_buffer) < ctx_len:
+                    # Pad with first observation/action
+                    pad_len = ctx_len - len(states_buffer)
+                    state_pad = np.repeat(states_arr[0:1], pad_len, axis=0)
+                    states = np.concatenate([state_pad, states_arr], axis=0)
+
+                    action_pad = np.repeat(pad_action[None, :], pad_len, axis=0)
+                    actions = np.concatenate([action_pad, actions_seq], axis=0)
+                else:
+                    states = states_arr[-ctx_len:]
+                    actions = actions_seq[-ctx_len:]
                 
                 # Add batch dimension
                 states_input = jnp.array(states[None])
