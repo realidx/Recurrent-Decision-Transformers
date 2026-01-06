@@ -143,17 +143,7 @@ class UTGCDT(nn.Module):
         total_seq_len = hidden.shape[1]
         plan_offset = 1 if self.use_plan_token else 0
 
-        attn_mask = None
-        if self.use_plan_token and self.plan_token_bidirectional:
-            attn_mask = jnp.tril(jnp.ones((total_seq_len, total_seq_len)))
-            attn_mask = attn_mask.at[0, :].set(1)
-            if self.plan_token_block_last_action:
-                last_action_idx = plan_offset + 2 * seq_len
-                attn_mask = attn_mask.at[0, last_action_idx].set(0)
-            attn_mask = attn_mask[None, None, :, :]
-        total_seq_len = hidden.shape[1]
-        plan_offset = 1 if self.use_plan_token else 0
-
+        # Build attention mask for plan token bidirectional attention
         attn_mask = None
         if self.use_plan_token and self.plan_token_bidirectional:
             attn_mask = jnp.tril(jnp.ones((total_seq_len, total_seq_len)))
@@ -245,7 +235,7 @@ class GCDT(nn.Module):
             action_dim=self.action_dim,
             use_plan_token=self.use_plan_token,
         )
-        
+
         # Stacked transformer layers (untied weights)
         self.transformer_layers = [
             TransformerBlock(
@@ -257,15 +247,20 @@ class GCDT(nn.Module):
             )
             for i in range(self.num_layers)
         ]
-        
+
         # Final layer norm
         self.final_ln = nn.LayerNorm()
-        
-        # Prediction head
-        self.action_head = ActionHead(
-            action_dim=self.action_dim,
-            hidden_dim=self.hidden_dim,
-        )
+
+        # Independent action heads for each layer (per protocol: "steel-manning" the baseline)
+        # Each layer l has its own projection head H_l to predict actions
+        self.action_heads = [
+            ActionHead(
+                action_dim=self.action_dim,
+                hidden_dim=self.hidden_dim,
+                name=f"action_head_{i}"
+            )
+            for i in range(self.num_layers)
+        ]
     
     @nn.compact
     def __call__(
@@ -275,30 +270,52 @@ class GCDT(nn.Module):
         goals: jnp.ndarray,
         timesteps: jnp.ndarray,
         deterministic: bool = True,
-        return_intermediates: bool = False,  # Unused, for API compatibility with UTGCDT
+        return_intermediates: bool = False,  # For deep supervision with independent heads
     ) -> Dict[str, Any]:
         """Forward pass through stacked transformer layers."""
         batch_size, seq_len, _ = states.shape
-        
+
         # Embed tokens
         hidden, plan_token_idx = self.token_embed(states, actions, goals, timesteps)
-        
+        total_seq_len = hidden.shape[1]
+        plan_offset = 1 if self.use_plan_token else 0
+
+        # Build attention mask
+        attn_mask = None
+        if self.use_plan_token and self.plan_token_bidirectional:
+            attn_mask = jnp.tril(jnp.ones((total_seq_len, total_seq_len)))
+            attn_mask = attn_mask.at[0, :].set(1)
+            if self.plan_token_block_last_action:
+                last_action_idx = plan_offset + 2 * seq_len
+                attn_mask = attn_mask.at[0, last_action_idx].set(0)
+            attn_mask = attn_mask[None, None, :, :]
+
+        # Index of last state token for action prediction
+        last_state_idx = plan_offset + 1 + 2 * (seq_len - 1)
+
+        # Store intermediate action predictions for deep supervision
+        intermediate_action_preds = []
+
         # Apply transformer layers sequentially (different weights each layer)
-        for layer in self.transformer_layers:
+        for i, layer in enumerate(self.transformer_layers):
             hidden = layer(hidden, mask=attn_mask, deterministic=deterministic)
-        
+
+            # Independent action head per layer (for deep supervision)
+            if return_intermediates or i == len(self.transformer_layers) - 1:
+                layer_hidden = self.final_ln(hidden) if i == len(self.transformer_layers) - 1 else nn.LayerNorm()(hidden)
+                last_state_hidden = layer_hidden[:, last_state_idx, :]
+                action_pred = self.action_heads[i](last_state_hidden)
+                intermediate_action_preds.append(action_pred)
+
         # Final layer norm
         hidden = self.final_ln(hidden)
-        
-        # Get hidden state for last state token
-        last_state_idx = plan_offset + 1 + 2 * (seq_len - 1)
-        last_state_hidden = hidden[:, last_state_idx, :]
-        
-        # Predict action
-        action_pred = self.action_head(last_state_hidden)
-        
+
+        # Final action prediction (from the last layer's head)
+        action_pred = intermediate_action_preds[-1]
+
         return {
             "action_pred": action_pred,
+            "intermediate_action_preds": intermediate_action_preds,
             "hidden_states": hidden,
             "plan_token_idx": plan_token_idx,
         }

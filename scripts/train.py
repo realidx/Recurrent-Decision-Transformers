@@ -128,6 +128,9 @@ def compute_loss(
         metrics: Dictionary of individual loss components
     """
     # Forward pass
+    # return_intermediates=True enables deep supervision for both:
+    # - UTGCDT: waypoint predictions at each iteration
+    # - GCDT: action predictions from each layer's independent head
     outputs = apply_fn(
         params,
         states=batch["states"],
@@ -135,7 +138,7 @@ def compute_loss(
         goals=batch["goals"],
         timesteps=batch["timesteps"],
         deterministic=deterministic,
-        return_intermediates=aux_use_waypoint_loss and aux_deep_supervision,
+        return_intermediates=aux_deep_supervision,
         rngs={"dropout": rng} if not deterministic else None,
     )
     
@@ -143,10 +146,25 @@ def compute_loss(
     action_pred = outputs["action_pred"]
     target_actions = batch["target_actions"]
     action_loss = jnp.mean((action_pred - target_actions) ** 2)
-    
+
     metrics = {"action_loss": action_loss}
     total_loss = action_loss
-    
+
+    # Deep supervision for stacked GCDT with independent heads
+    # Per protocol: Each layer l has its own head H_l with supervision
+    if "intermediate_action_preds" in outputs and aux_deep_supervision:
+        intermediate_preds = outputs["intermediate_action_preds"]
+        if len(intermediate_preds) > 1:
+            # Apply loss to all intermediate heads (weighted towards later layers)
+            deep_action_loss = 0.0
+            num_layers = len(intermediate_preds)
+            for i, pred in enumerate(intermediate_preds[:-1]):  # Exclude final (already in action_loss)
+                weight = (i + 1) / num_layers  # Later layers matter more
+                deep_action_loss += weight * jnp.mean((pred - target_actions) ** 2)
+            deep_action_loss /= (num_layers - 1) if num_layers > 1 else 1
+            metrics["deep_action_loss"] = deep_action_loss
+            total_loss += 0.5 * deep_action_loss  # Weighted contribution
+
     # Waypoint auxiliary loss
     if aux_use_waypoint_loss and "waypoint_preds" in outputs:
         waypoint_preds = outputs["waypoint_preds"]

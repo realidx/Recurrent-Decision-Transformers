@@ -2,7 +2,7 @@
 
 import os
 from dataclasses import dataclass, field
-from typing import Optional, List
+from typing import List
 
 
 @dataclass
@@ -76,10 +76,12 @@ class TrainingConfig:
     seed: int = 42
     
 
-@dataclass  
+@dataclass
 class DataConfig:
     """Dataset configuration."""
-    dataset_name: str = "antmaze-medium-stitch-v0"
+    # Primary dataset: antmaze-large-stitch-v0 (The Crucible - hardest stitching task)
+    # Contingency: antmaze-medium-play-v0 or kitchen-mixed-v0 if standard DT fails
+    dataset_name: str = "antmaze-large-stitch-v0"
     dataset_dir: str = field(
         default_factory=lambda: os.environ.get("OGBENCH_DATASET_DIR", "./ogbench_data")
     )
@@ -123,38 +125,74 @@ class Config:
 
 # Preset configurations for experiments
 def get_gcdt_baseline_config() -> Config:
-    """Standard GCDT baseline (untied layers, no plan token)."""
+    """
+    Standard GCDT baseline (untied layers, no plan token).
+
+    Per protocol ("Steel-Manning"):
+    - Independent action heads: Each layer l has its own projection head H_l
+    - Deep supervision on all heads
+    - This gives the baseline maximum flexibility to learn layer-specific representations
+    """
     config = Config(exp_name="gcdt_baseline")
     config.model.use_weight_tying = False
     config.model.use_plan_token = False
     config.model.use_step_embeddings = False
     config.aux.use_waypoint_loss = False
+    # Enable deep supervision for independent heads
+    config.aux.deep_supervision = True
     return config
 
 
 def get_ut_gcdt_config() -> Config:
-    """UT-GCDT with weight tying only."""
+    """
+    U-GCDT with weight tying only.
+
+    Per protocol:
+    - Shared action head (one H used for all steps k)
+    - Sinusoidal step embeddings (no learned params for step counter)
+    """
     config = Config(exp_name="ut_gcdt_tied")
     config.model.use_weight_tying = True
     config.model.use_plan_token = False
+    config.model.use_step_embeddings = True
+    config.model.step_embedding_type = "sinusoidal"  # Fixed, no param leak
     config.aux.use_waypoint_loss = False
     return config
 
 
 def get_ut_gcdt_plan_config() -> Config:
-    """UT-GCDT with plan token."""
+    """
+    U-GCDT with plan token.
+
+    Per protocol:
+    - Shared action head
+    - Sinusoidal step embeddings (no param leak)
+    - Plan token for iterative refinement
+    """
     config = Config(exp_name="ut_gcdt_plan")
     config.model.use_weight_tying = True
     config.model.use_plan_token = True
+    config.model.use_step_embeddings = True
+    config.model.step_embedding_type = "sinusoidal"  # Fixed, no param leak
     config.aux.use_waypoint_loss = False
     return config
 
 
 def get_ut_gcdt_full_config() -> Config:
-    """UT-GCDT with plan token and waypoint loss (full model)."""
+    """
+    U-GCDT Full: Plan token + Waypoint loss + Deep supervision.
+
+    Per protocol:
+    - Shared action head
+    - Sinusoidal step embeddings (no param leak)
+    - Plan token for iterative refinement
+    - Waypoint auxiliary loss with deep supervision
+    """
     config = Config(exp_name="ut_gcdt_full")
     config.model.use_weight_tying = True
     config.model.use_plan_token = True
+    config.model.use_step_embeddings = True
+    config.model.step_embedding_type = "sinusoidal"  # Fixed, no param leak
     config.aux.use_waypoint_loss = True
     config.aux.deep_supervision = True
     return config
