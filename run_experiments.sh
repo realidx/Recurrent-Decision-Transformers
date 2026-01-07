@@ -143,16 +143,36 @@ echo "Results saved to: $OUTPUT_DIR"
 echo "========================================"
 
 # ============================================
-# Phase 3: Test-Time Scaling Experiments
+# Phase 3: Evaluation and Test-Time Scaling
 # ============================================
 echo ""
-echo "[Phase 3] Test-Time Scaling Experiments"
-echo "Train with K=4, test with K'=2,4,6,8,12"
+echo "[Phase 3] Evaluation"
 echo ""
-echo "Run after training completes:"
-echo "  python scripts/eval.py --checkpoint outputs/ut_gcdt_full_*/best_* --test_iterations 2 4 6 8 12"
+echo "========================================"
+echo "MODEL COMPARISON (run after training)"
+echo "========================================"
+echo "Compare all trained models to understand ablation results:"
 echo ""
-echo "Expected result: Curve should rise steeply initially and continue rising or plateau (not crash) beyond K=4"
+echo "1. Standard evaluation (compare all models):"
+echo "   for model in gcdt_baseline ut_gcdt_tied ut_gcdt_plan ut_gcdt_full; do"
+echo "     python scripts/eval.py --checkpoint outputs/\${model}_*/best_* --test_iterations 4"
+echo "   done"
+echo ""
+echo "2. Test-time scaling (UT models only - can use more iterations at test time):"
+echo "   python scripts/eval.py --checkpoint outputs/ut_gcdt_tied_*/best_* --test_iterations 2 4 6 8 12"
+echo "   python scripts/eval.py --checkpoint outputs/ut_gcdt_plan_*/best_* --test_iterations 2 4 6 8 12"
+echo "   python scripts/eval.py --checkpoint outputs/ut_gcdt_full_*/best_* --test_iterations 2 4 6 8 12"
+echo ""
+echo "Expected results:"
+echo "  - ut_gcdt_* should benefit from more iterations (curve rises then plateaus)"
+echo "  - gcdt_baseline cannot do test-time scaling (fixed architecture)"
+echo ""
+echo "Ablation questions answered by comparing models:"
+echo "  Q1: Does weight tying help?     -> Compare gcdt_baseline vs ut_gcdt_tied"
+echo "  Q2: Does plan token help?       -> Compare ut_gcdt_tied vs ut_gcdt_plan"
+echo "  Q3: Does waypoint loss help?    -> Compare ut_gcdt_plan vs ut_gcdt_full"
+echo "  Q4: Does test-time scaling work? -> Compare ut_* at K=4 vs K=8"
+echo "========================================"
 
 # ============================================
 # Realizability Check (Go/No-Go)
