@@ -402,7 +402,13 @@ def evaluate_policy(
 def train(config: Config):
     """Main training loop with multi-GPU support."""
 
-    # Allow environment overrides to reduce log spam on clusters.
+    # Allow environment overrides for fast iteration on clusters
+    max_steps = os.environ.get("MAX_STEPS")
+    if max_steps:
+        config.training.max_steps = int(max_steps)
+    eval_episodes = os.environ.get("EVAL_EPISODES")
+    if eval_episodes:
+        config.training.eval_episodes = int(eval_episodes)
     log_every = os.environ.get("LOG_EVERY")
     if log_every:
         config.training.log_every = int(log_every)
@@ -607,6 +613,10 @@ if __name__ == "__main__":
     parser.add_argument("--dataset", type=str, default="antmaze-medium-stitch-v0")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output_dir", type=str, default="./outputs")
+    # Training overrides for fast iteration
+    parser.add_argument("--max_steps", type=int, default=None, help="Override max training steps")
+    parser.add_argument("--eval_episodes", type=int, default=None, help="Override eval episodes")
+    parser.add_argument("--eval_every", type=int, default=None, help="Override eval frequency")
     args = parser.parse_args()
     
     # Get config
@@ -628,5 +638,13 @@ if __name__ == "__main__":
     config.data.dataset_name = args.dataset
     config.training.seed = args.seed
     config.output_dir = args.output_dir
-    
+
+    # Apply command-line overrides
+    if args.max_steps is not None:
+        config.training.max_steps = args.max_steps
+    if args.eval_episodes is not None:
+        config.training.eval_episodes = args.eval_episodes
+    if args.eval_every is not None:
+        config.training.eval_every = args.eval_every
+
     train(config)
