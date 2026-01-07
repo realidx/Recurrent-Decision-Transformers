@@ -27,9 +27,9 @@ else
 fi
 conda activate "${CONDA_ENV:-mytrain}"
 
-# JAX runtime knobs (optional)
-# export XLA_PYTHON_CLIENT_PREALLOCATE=false
-# export XLA_PYTHON_CLIENT_MEM_FRACTION=0.9
+# JAX runtime knobs - enable for better memory efficiency
+export XLA_PYTHON_CLIENT_PREALLOCATE=false
+export XLA_PYTHON_CLIENT_MEM_FRACTION=0.9
 
 mkdir -p outputs
 
@@ -41,6 +41,14 @@ export SKIP_BASELINES="${SKIP_BASELINES:-1}"
 export LOG_EVERY="${LOG_EVERY:-1000}"
 export EVAL_EVERY="${EVAL_EVERY:-10000}"
 export SAVE_EVERY="${SAVE_EVERY:-10000}"
+
+# FAST_MODE: Set to 1 for quick iteration (~1h/model instead of ~4h)
+# Uses: 25k steps (vs 100k), 20 eval episodes (vs 100), single seed
+export FAST_MODE="${FAST_MODE:-0}"
+
+# Additional overrides for fine-grained control
+export MAX_STEPS="${MAX_STEPS:-}"
+export EVAL_EPISODES="${EVAL_EPISODES:-}"
 
 if [ -z "${OGBENCH_DATASET_DIR:-}" ]; then
   if [ -d "$HOME/ogbench/data" ]; then

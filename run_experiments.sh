@@ -10,10 +10,42 @@ OUTPUT_DIR="${OUTPUT_DIR:-./outputs}"
 SEEDS="${SEEDS:-42 123 456}"
 SKIP_BASELINES="${SKIP_BASELINES:-0}"
 
+# ============================================
+# FAST_MODE: For quick iteration and debugging
+# ============================================
+# Set FAST_MODE=1 to run with reduced settings:
+#   - 25k steps instead of 100k (4x faster training)
+#   - 20 eval episodes instead of 100 (5x faster eval)
+#   - 1 seed instead of 3 (3x fewer runs)
+# Estimated time: ~1h per model instead of ~4h
+FAST_MODE="${FAST_MODE:-0}"
+
+if [ "$FAST_MODE" -eq 1 ]; then
+    echo ">>> FAST_MODE enabled - using reduced settings for quick iteration <<<"
+    export MAX_STEPS="${MAX_STEPS:-25000}"
+    export EVAL_EPISODES="${EVAL_EPISODES:-20}"
+    export EVAL_EVERY="${EVAL_EVERY:-5000}"
+    export SAVE_EVERY="${SAVE_EVERY:-10000}"
+    SEEDS="${SEEDS:-42}"  # Single seed in fast mode
+fi
+
+# Allow explicit overrides even without FAST_MODE
+export MAX_STEPS="${MAX_STEPS:-}"
+export EVAL_EPISODES="${EVAL_EPISODES:-}"
+export EVAL_EVERY="${EVAL_EVERY:-}"
+export SAVE_EVERY="${SAVE_EVERY:-}"
+
 echo "========================================"
 echo "U-GCDT Experiments on OGBench"
 echo "Dataset: $DATASET"
 echo "Following Steel-Manned Protocol"
+echo "========================================"
+echo "Configuration:"
+echo "  Seeds: $SEEDS"
+echo "  Output: $OUTPUT_DIR"
+if [ -n "$MAX_STEPS" ]; then echo "  Max steps: $MAX_STEPS"; fi
+if [ -n "$EVAL_EPISODES" ]; then echo "  Eval episodes: $EVAL_EPISODES"; fi
+if [ -n "$EVAL_EVERY" ]; then echo "  Eval every: $EVAL_EVERY"; fi
 echo "========================================"
 
 # Create output directory
@@ -135,4 +167,30 @@ echo "  2. GCBC score = Floor to beat"
 echo "  3. Stacked GCDT > GCBC? "
 echo "     YES -> Proceed to Phase 2 (U-GCDT)"
 echo "     NO  -> Switch loss from MSE to IQL-style Expectile Loss"
+echo "========================================"
+
+# ============================================
+# Tips for faster iteration
+# ============================================
+echo ""
+echo "========================================"
+echo "TIPS FOR FASTER ITERATION"
+echo "========================================"
+echo "If experiments are taking too long:"
+echo ""
+echo "1. Use FAST_MODE for quick validation:"
+echo "   FAST_MODE=1 ./run_experiments.sh"
+echo ""
+echo "2. Run single models with custom settings:"
+echo "   MAX_STEPS=25000 EVAL_EPISODES=20 python scripts/train.py --config ut_gcdt --seed 42"
+echo ""
+echo "3. Skip baselines if already computed:"
+echo "   SKIP_BASELINES=1 ./run_experiments.sh"
+echo ""
+echo "4. Use a single seed for initial exploration:"
+echo "   SEEDS=42 ./run_experiments.sh"
+echo ""
+echo "Note: 'best_' checkpoints are only saved when success_rate improves."
+echo "If no best checkpoint exists, the model may need more training time"
+echo "or the task is too difficult for the current architecture."
 echo "========================================"
