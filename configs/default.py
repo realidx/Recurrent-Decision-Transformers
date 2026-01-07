@@ -26,7 +26,12 @@ class ModelConfig:
     # Step embeddings for UT iterations
     use_step_embeddings: bool = True
     step_embedding_type: str = "learned"  # "learned" or "sinusoidal"
-    
+
+    # Gated recurrent loop (URM-style)
+    # H_{k+1} = (1-g) * H_k + g * Block(H_k)
+    # Helps with gradient flow and allows model to control update magnitude
+    use_gated_loop: bool = False
+
     # Plan token
     use_plan_token: bool = True
     plan_token_bidirectional: bool = False
@@ -193,6 +198,52 @@ def get_ut_gcdt_full_config() -> Config:
     config.model.use_plan_token = True
     config.model.use_step_embeddings = True
     config.model.step_embedding_type = "sinusoidal"  # Fixed, no param leak
+    config.aux.use_waypoint_loss = True
+    config.aux.deep_supervision = True
+    return config
+
+
+def get_ut_gcdt_gated_config() -> Config:
+    """
+    U-GCDT with Gated Recurrent Loop (URM-style).
+
+    Key change: Uses gated update instead of naive residual:
+    H_{k+1} = (1-g) * H_k + g * Block(H_k)
+
+    Benefits:
+    - Better gradient flow through iterations
+    - Model can control update magnitude per position
+    - Stabilizes training for deeper iteration counts
+    - Inspired by GRU/LSTM gating and Universal Recurrent Memory
+
+    Config: Weight tying + Plan token + Gated loop (no waypoint loss)
+    """
+    config = Config(exp_name="ut_gcdt_gated")
+    config.model.use_weight_tying = True
+    config.model.use_plan_token = True
+    config.model.use_step_embeddings = True
+    config.model.step_embedding_type = "sinusoidal"  # Fixed, no param leak
+    config.model.use_gated_loop = True
+    config.aux.use_waypoint_loss = False
+    return config
+
+
+def get_ut_gcdt_gated_full_config() -> Config:
+    """
+    U-GCDT Full + Gated Recurrent Loop.
+
+    Combines all features:
+    - Weight tying (Universal Transformer)
+    - Plan token for iterative refinement
+    - Gated recurrent loop (URM-style)
+    - Waypoint auxiliary loss with deep supervision
+    """
+    config = Config(exp_name="ut_gcdt_gated_full")
+    config.model.use_weight_tying = True
+    config.model.use_plan_token = True
+    config.model.use_step_embeddings = True
+    config.model.step_embedding_type = "sinusoidal"
+    config.model.use_gated_loop = True
     config.aux.use_waypoint_loss = True
     config.aux.deep_supervision = True
     return config

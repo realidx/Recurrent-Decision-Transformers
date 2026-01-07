@@ -12,6 +12,7 @@ from .components import (
     SinusoidalEmbedding,
     ActionHead,
     WaypointHead,
+    RecurrentGate,
 )
 
 
@@ -39,7 +40,13 @@ class UTGCDT(nn.Module):
     num_iterations: int = 4  # K: number of times to apply transformer block
     use_step_embeddings: bool = True
     step_embedding_type: str = "learned"  # "learned" or "sinusoidal"
-    
+
+    # Gated recurrent loop (URM-style)
+    # Instead of H_{k+1} = Block(H_k), uses:
+    # H_{k+1} = (1-g) * H_k + g * Block(H_k)
+    # where g = sigmoid(W_gate * [H_k, Block(H_k)])
+    use_gated_loop: bool = False
+
     # Plan token
     use_plan_token: bool = True
     plan_token_bidirectional: bool = False
@@ -80,7 +87,11 @@ class UTGCDT(nn.Module):
                     nn.initializers.normal(stddev=0.02),
                     (self.num_iterations, self.hidden_dim),
                 )
-        
+
+        # Gated recurrent mechanism (optional)
+        if self.use_gated_loop:
+            self.recurrent_gate = RecurrentGate(hidden_dim=self.hidden_dim)
+
         # Final layer norm
         self.final_ln = nn.LayerNorm()
         
@@ -156,25 +167,37 @@ class UTGCDT(nn.Module):
         # Store intermediate outputs for deep supervision
         waypoint_preds = []
         plan_states = []
-        
+        gate_values = []  # Store gate values for analysis
+
         # Apply transformer block K times (Universal Transformer loop)
         for k in range(K):
             # Add step embedding
             step_emb = self.get_step_embedding(k, batch_size, total_seq_len)
             hidden_with_step = hidden + step_emb
-            
+
             # Apply transformer block (same weights each iteration)
-            hidden = self.transformer_block(
+            proposal = self.transformer_block(
                 hidden_with_step,
                 mask=attn_mask,
                 deterministic=deterministic
             )
-            
+
+            # Gated update vs naive update
+            if self.use_gated_loop:
+                # Gated: H_{k+1} = (1-g) * H_k + g * proposal
+                # Gate sees both old state and new proposal
+                hidden, gate = self.recurrent_gate(hidden, proposal)
+                if return_intermediates:
+                    gate_values.append(gate)
+            else:
+                # Naive: H_{k+1} = proposal (transformer block has internal residuals)
+                hidden = proposal
+
             # Extract plan token state and predict waypoint (for deep supervision)
             if self.use_plan_token and self.use_waypoint_head:
                 plan_state = hidden[:, plan_token_idx, :]  # (batch, hidden_dim)
                 plan_states.append(plan_state)
-                
+
                 if return_intermediates or k == K - 1:
                     waypoint_pred = self.waypoint_head(plan_state)
                     waypoint_preds.append(waypoint_pred)
@@ -198,6 +221,7 @@ class UTGCDT(nn.Module):
             "plan_states": plan_states,
             "hidden_states": hidden,
             "plan_token_idx": plan_token_idx,
+            "gate_values": gate_values,  # Gate activations for analysis
         }
 
 
@@ -340,6 +364,7 @@ def create_model(config) -> nn.Module:
             num_iterations=config.model.num_iterations,
             use_step_embeddings=config.model.use_step_embeddings,
             step_embedding_type=config.model.step_embedding_type,
+            use_gated_loop=config.model.use_gated_loop,
             use_plan_token=config.model.use_plan_token,
             plan_token_bidirectional=config.model.plan_token_bidirectional,
             plan_token_block_last_action=config.model.plan_token_block_last_action,

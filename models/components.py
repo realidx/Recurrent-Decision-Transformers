@@ -244,6 +244,59 @@ class TransformerBlock(nn.Module):
         return x
 
 
+class RecurrentGate(nn.Module):
+    """
+    Gated recurrent update mechanism for Universal Transformer.
+
+    Instead of naive residual: H_{k+1} = Block(H_k)
+    Uses sigmoid-weighted mixing: H_{k+1} = (1-g) * H_k + g * Block(H_k)
+
+    This allows the model to control information flow:
+    - g ≈ 0: preserve previous state (keep memory)
+    - g ≈ 1: fully update to new proposal (write new thoughts)
+
+    Inspired by GRU/LSTM gating and Universal Recurrent Memory (URM).
+    """
+    hidden_dim: int
+
+    @nn.compact
+    def __call__(
+        self,
+        h_prev: jnp.ndarray,      # Previous hidden state (batch, seq_len, hidden_dim)
+        h_proposal: jnp.ndarray,  # New proposal from transformer block
+    ) -> Tuple[jnp.ndarray, jnp.ndarray]:
+        """
+        Compute gated update.
+
+        Args:
+            h_prev: Previous hidden state
+            h_proposal: Proposed new state from transformer block
+
+        Returns:
+            h_next: Updated hidden state
+            gate: Gate values for analysis/visualization (batch, seq_len, hidden_dim)
+        """
+        # Concatenate previous state and proposal for gate computation
+        # Gate sees both old and new to decide how much to update
+        gate_input = jnp.concatenate([h_prev, h_proposal], axis=-1)
+
+        # Project to gate logits
+        gate_logits = nn.Dense(
+            self.hidden_dim,
+            name="gate_proj",
+            kernel_init=nn.initializers.xavier_uniform(),
+            bias_init=nn.initializers.zeros,
+        )(gate_input)
+
+        # Sigmoid activation to get values in [0, 1]
+        gate = jax.nn.sigmoid(gate_logits)
+
+        # Gated update: soft blend between old and new
+        h_next = (1 - gate) * h_prev + gate * h_proposal
+
+        return h_next, gate
+
+
 class ActionHead(nn.Module):
     """Action prediction head."""
     action_dim: int
