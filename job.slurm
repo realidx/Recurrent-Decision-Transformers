@@ -16,8 +16,16 @@ set -euo pipefail
 # module purge
 # module load cuda/12.2
 # module load cudnn/9.1
-source ~/miniconda3/etc/profile.d/conda.sh
-conda activate mytrain
+if [ -n "${CONDA_BASE:-}" ] && [ -f "$CONDA_BASE/etc/profile.d/conda.sh" ]; then
+  source "$CONDA_BASE/etc/profile.d/conda.sh"
+elif command -v conda >/dev/null 2>&1; then
+  CONDA_BASE="$(conda info --base)"
+  source "$CONDA_BASE/etc/profile.d/conda.sh"
+else
+  echo "Conda not found. Set CONDA_BASE or load your environment modules."
+  exit 1
+fi
+conda activate "${CONDA_ENV:-mytrain}"
 
 # JAX runtime knobs (optional)
 # export XLA_PYTHON_CLIENT_PREALLOCATE=false
@@ -25,23 +33,23 @@ conda activate mytrain
 
 mkdir -p outputs
 
-DATASETS=("antmaze-medium-stitch-v0")
-SEEDS=(42 123 456)
-CONFIGS=("gcdt_baseline" "ut_gcdt" "ut_gcdt_plan" "ut_gcdt_full")
-
 OUTPUT_ROOT="${OUTPUT_ROOT:-./outputs}"
+export DATASET="${DATASET:-antmaze-large-stitch-v0}"
+export OUTPUT_DIR="${OUTPUT_DIR:-$OUTPUT_ROOT/$DATASET}"
+export SEEDS="${SEEDS:-42 123 456}"
+export SKIP_BASELINES="${SKIP_BASELINES:-1}"
+export LOG_EVERY="${LOG_EVERY:-1000}"
+export EVAL_EVERY="${EVAL_EVERY:-10000}"
+export SAVE_EVERY="${SAVE_EVERY:-10000}"
 
-for dataset in "${DATASETS[@]}"; do
-  for config in "${CONFIGS[@]}"; do
-    for seed in "${SEEDS[@]}"; do
-      echo "Running ${config} on ${dataset} (seed=${seed})"
-      python scripts/train.py \
-        --config "${config}" \
-        --dataset "${dataset}" \
-        --seed "${seed}" \
-        --output_dir "${OUTPUT_ROOT}/${dataset}"
-    done
-  done
-done
+if [ -z "${OGBENCH_DATASET_DIR:-}" ]; then
+  if [ -d "$HOME/ogbench/data" ]; then
+    export OGBENCH_DATASET_DIR="$HOME/ogbench/data"
+  elif [ -d "$HOME/ogbench/ogbench/data" ]; then
+    export OGBENCH_DATASET_DIR="$HOME/ogbench/ogbench/data"
+  fi
+fi
+
+bash run_experiments.sh
 
 echo "All experiments complete."

@@ -251,6 +251,12 @@ class GCDT(nn.Module):
         # Final layer norm
         self.final_ln = nn.LayerNorm()
 
+        # Layer norms for intermediate supervision (one per non-final layer)
+        self.intermediate_lns = [
+            nn.LayerNorm(name=f"intermediate_ln_{i}")
+            for i in range(self.num_layers - 1)
+        ]
+
         # Independent action heads for each layer (per protocol: "steel-manning" the baseline)
         # Each layer l has its own projection head H_l to predict actions
         self.action_heads = [
@@ -302,7 +308,7 @@ class GCDT(nn.Module):
 
             # Independent action head per layer (for deep supervision)
             if return_intermediates or i == len(self.transformer_layers) - 1:
-                layer_hidden = self.final_ln(hidden) if i == len(self.transformer_layers) - 1 else nn.LayerNorm()(hidden)
+                layer_hidden = self.final_ln(hidden) if i == len(self.transformer_layers) - 1 else self.intermediate_lns[i](hidden)
                 last_state_hidden = layer_hidden[:, last_state_idx, :]
                 action_pred = self.action_heads[i](last_state_hidden)
                 intermediate_action_preds.append(action_pred)

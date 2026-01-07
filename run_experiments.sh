@@ -5,9 +5,10 @@
 # Configuration
 # Primary: antmaze-large-stitch-v0 (The Crucible - hardest stitching task per protocol)
 # Contingency: antmaze-medium-play-v0 or kitchen-mixed-v0 if standard DT fails
-DATASET="antmaze-large-stitch-v0"
-OUTPUT_DIR="./outputs"
-SEEDS="42 123 456"
+DATASET="${DATASET:-antmaze-large-stitch-v0}"
+OUTPUT_DIR="${OUTPUT_DIR:-./outputs}"
+SEEDS="${SEEDS:-42 123 456}"
+SKIP_BASELINES="${SKIP_BASELINES:-0}"
 
 echo "========================================"
 echo "U-GCDT Experiments on OGBench"
@@ -22,27 +23,32 @@ mkdir -p $OUTPUT_DIR
 # Phase 1: Establish Baselines (Day 1-3)
 # ============================================
 
-# Step 0: Run HIQL baseline (target score)
-echo ""
-echo "[Phase 1] Running HIQL baseline (target score)..."
-for seed in $SEEDS; do
-    echo "  Seed: $seed"
-    python scripts/run_hiql_baseline.py \
-        --dataset $DATASET \
-        --seed $seed \
-        --output_dir $OUTPUT_DIR/baselines
-done
+if [ "$SKIP_BASELINES" -ne 1 ]; then
+    # Step 0: Run HIQL baseline (target score)
+    echo ""
+    echo "[Phase 1] Running HIQL baseline (target score)..."
+    for seed in $SEEDS; do
+        echo "  Seed: $seed"
+        python scripts/run_hiql_baseline.py \
+            --dataset $DATASET \
+            --seed $seed \
+            --output_dir $OUTPUT_DIR/baselines
+    done
 
-# Step 1: Run GCBC (floor score)
-echo ""
-echo "[Phase 1] Running GCBC baseline (floor score)..."
-for seed in $SEEDS; do
-    echo "  Seed: $seed"
-    python scripts/run_gcbc_baseline.py \
-        --dataset $DATASET \
-        --seed $seed \
-        --output_dir $OUTPUT_DIR/baselines 2>/dev/null || echo "  GCBC script not found, skipping..."
-done
+    # Step 1: Run GCBC (floor score)
+    echo ""
+    echo "[Phase 1] Running GCBC baseline (floor score)..."
+    for seed in $SEEDS; do
+        echo "  Seed: $seed"
+        python scripts/run_gcbc_baseline.py \
+            --dataset $DATASET \
+            --seed $seed \
+            --output_dir $OUTPUT_DIR/baselines 2>/dev/null || echo "  GCBC script not found, skipping..."
+    done
+else
+    echo ""
+    echo "[Phase 1] Skipping HIQL/GCBC baselines (SKIP_BASELINES=1)"
+fi
 
 # Step 2: Stacked GCDT Baseline (Independent Heads + Deep Supervision)
 # Per protocol: "Each layer l has its own projection head H_l to predict actions"

@@ -62,6 +62,7 @@ def create_train_state(
         goals=dummy_goals,
         timesteps=dummy_timesteps,
         deterministic=True,
+        return_intermediates=config.aux.deep_supervision,
     )
     
     # Count parameters
@@ -400,6 +401,17 @@ def evaluate_policy(
 
 def train(config: Config):
     """Main training loop with multi-GPU support."""
+
+    # Allow environment overrides to reduce log spam on clusters.
+    log_every = os.environ.get("LOG_EVERY")
+    if log_every:
+        config.training.log_every = int(log_every)
+    eval_every = os.environ.get("EVAL_EVERY")
+    if eval_every:
+        config.training.eval_every = int(eval_every)
+    save_every = os.environ.get("SAVE_EVERY")
+    if save_every:
+        config.training.save_every = int(save_every)
 
     # Set random seed
     np.random.seed(config.training.seed)
