@@ -163,11 +163,16 @@ class UTGCDT(nn.Module):
                 last_action_idx = plan_offset + 2 * seq_len
                 attn_mask = attn_mask.at[0, last_action_idx].set(0)
             attn_mask = attn_mask[None, None, :, :]
-        
+
+        # Index of last state token for action prediction
+        # Sequence: [PLAN] [GOAL] s_0 a_0 s_1 a_1 ... s_t a_t
+        last_state_idx = plan_offset + 1 + 2 * (seq_len - 1)
+
         # Store intermediate outputs for deep supervision
         waypoint_preds = []
         plan_states = []
         gate_values = []  # Store gate values for analysis
+        intermediate_action_preds = []  # Action predictions at each step k (shared head)
 
         # Apply transformer block K times (Universal Transformer loop)
         for k in range(K):
@@ -193,6 +198,15 @@ class UTGCDT(nn.Module):
                 # Naive: H_{k+1} = proposal (transformer block has internal residuals)
                 hidden = proposal
 
+            # Deep supervision: predict action at each step k using SHARED head
+            # This enables summed loss across all iterations (like independent heads for baseline)
+            if return_intermediates or k == K - 1:
+                # Apply layer norm before action prediction
+                step_hidden = self.final_ln(hidden)
+                last_state_hidden = step_hidden[:, last_state_idx, :]
+                step_action_pred = self.action_head(last_state_hidden)
+                intermediate_action_preds.append(step_action_pred)
+
             # Extract plan token state and predict waypoint (for deep supervision)
             if self.use_plan_token and self.use_waypoint_head:
                 plan_state = hidden[:, plan_token_idx, :]  # (batch, hidden_dim)
@@ -202,21 +216,15 @@ class UTGCDT(nn.Module):
                     waypoint_pred = self.waypoint_head(plan_state)
                     waypoint_preds.append(waypoint_pred)
         
-        # Final layer norm
+        # Final layer norm (already applied in loop for action predictions)
         hidden = self.final_ln(hidden)
-        
-        # Get the hidden state for the last state token to predict action
-        # Sequence: [PLAN] [GOAL] s_0 a_0 s_1 a_1 ... s_t a_t
-        # Last state token is at position: plan_offset + 1 + 2*seq_len - 2 = plan_offset + 2*seq_len - 1
-        last_state_idx = plan_offset + 1 + 2 * (seq_len - 1)  # index of s_t
-        
-        last_state_hidden = hidden[:, last_state_idx, :]  # (batch, hidden_dim)
-        
-        # Predict action
-        action_pred = self.action_head(last_state_hidden)
-        
+
+        # Final action prediction is the last intermediate prediction
+        action_pred = intermediate_action_preds[-1]
+
         return {
             "action_pred": action_pred,
+            "intermediate_action_preds": intermediate_action_preds,  # For deep supervision
             "waypoint_preds": waypoint_preds,
             "plan_states": plan_states,
             "hidden_states": hidden,

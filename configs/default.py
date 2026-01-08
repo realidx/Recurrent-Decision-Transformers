@@ -10,17 +10,17 @@ class ModelConfig:
     """Model architecture configuration."""
     # Embedding dimensions
     hidden_dim: int = 256
-    
+
     # Transformer block
     num_heads: int = 4
     mlp_ratio: float = 4.0
     dropout_rate: float = 0.1
-    
-    # For standard GCDT (untied)
-    num_layers: int = 4
-    
-    # For UT-GCDT (tied)
-    num_iterations: int = 4  # K in the paper
+
+    # For standard GCDT (untied) - V3 Protocol: L=12 layers
+    num_layers: int = 12
+
+    # For UT-GCDT (tied) - V3 Protocol: K=12 iterations
+    num_iterations: int = 12  # K in the paper
     use_weight_tying: bool = True
     
     # Step embeddings for UT iterations
@@ -84,18 +84,25 @@ class TrainingConfig:
 @dataclass
 class DataConfig:
     """Dataset configuration."""
-    # Primary dataset: antmaze-large-stitch-v0 (The Crucible - hardest stitching task)
-    # Contingency: antmaze-medium-play-v0 or kitchen-mixed-v0 if standard DT fails
-    dataset_name: str = "antmaze-large-stitch-v0"
+    # Dataset type: "d4rl" or "ogbench"
+    dataset_type: str = "d4rl"
+
+    # V3 Protocol D4RL datasets:
+    #   - Debug/Sanity: antmaze-umaze-v2 (target: >50% success)
+    #   - Primary (Stitching): antmaze-medium-play-v2 (target: beat baseline by >10%)
+    #   - Secondary: kitchen-mixed-v0 (long-horizon manipulation)
+    dataset_name: str = "antmaze-umaze-v2"
+
+    # For OGBench (legacy)
     dataset_dir: str = field(
         default_factory=lambda: os.environ.get("OGBENCH_DATASET_DIR", "./ogbench_data")
     )
-    
+
     # Goal sampling strategy
     # "future": sample goals from future in same trajectory
     # "random": sample random goals from dataset
     goal_sampling: str = "future"
-    
+
     # Future goal horizon range (for "future" sampling)
     min_goal_horizon: int = 1
     max_goal_horizon: int = 50
@@ -104,9 +111,9 @@ class DataConfig:
 @dataclass
 class EvalConfig:
     """Evaluation configuration for test-time scaling experiments."""
-    # Test with different numbers of UT iterations
-    test_iterations: List[int] = field(default_factory=lambda: [4, 6, 8])
-    
+    # Test with different numbers of UT iterations (V3: K=12 training)
+    test_iterations: List[int] = field(default_factory=lambda: [6, 12, 18, 24])
+
     # Evaluate on different goal distance buckets
     goal_distance_buckets: List[int] = field(default_factory=lambda: [10, 25, 50, 100])
     
