@@ -1,4 +1,4 @@
-"""Training script for UT-GCDT on OGBench."""
+"""Training script for UT-GCDT on D4RL/OGBench."""
 
 import os
 import sys
@@ -28,7 +28,12 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from configs.default import Config, get_ut_gcdt_full_config
 from models import create_model, UTGCDT
-from data.ogbench_loader import load_ogbench_dataset, DataLoader, batch_to_jax
+from data.ogbench_loader import load_ogbench_dataset
+from data.ogbench_loader import DataLoader as OGBenchDataLoader
+from data.ogbench_loader import batch_to_jax as ogbench_batch_to_jax
+from data.d4rl_loader import load_d4rl_dataset
+from data.d4rl_loader import DataLoader as D4RLDataLoader
+from data.d4rl_loader import batch_to_jax as d4rl_batch_to_jax
 
 
 class TrainState(train_state.TrainState):
@@ -42,16 +47,20 @@ def create_train_state(
     config: Config,
     state_dim: int,
     action_dim: int,
+    goal_dim: int = None,
 ) -> TrainState:
     """Initialize model and optimizer."""
-    
+    # Goal dim defaults to state_dim if not specified
+    if goal_dim is None:
+        goal_dim = state_dim
+
     # Create dummy inputs for initialization
     batch_size = 2
     seq_len = config.training.context_len
-    
+
     dummy_states = jnp.zeros((batch_size, seq_len, state_dim))
     dummy_actions = jnp.zeros((batch_size, seq_len, action_dim))
-    dummy_goals = jnp.zeros((batch_size, state_dim))
+    dummy_goals = jnp.zeros((batch_size, goal_dim))
     dummy_timesteps = jnp.zeros((batch_size, seq_len), dtype=jnp.int32)
     
     # Initialize parameters
@@ -143,28 +152,30 @@ def compute_loss(
         rngs={"dropout": rng} if not deterministic else None,
     )
     
-    # Action prediction loss (MSE)
+    # Action prediction loss (MSE) - final layer/step only
     action_pred = outputs["action_pred"]
     target_actions = batch["target_actions"]
     action_loss = jnp.mean((action_pred - target_actions) ** 2)
 
     metrics = {"action_loss": action_loss}
-    total_loss = action_loss
 
-    # Deep supervision for stacked GCDT with independent heads
-    # Per protocol: Each layer l has its own head H_l with supervision
+    # V3 Protocol: Sum of MSE losses from ALL heads/steps (not weighted)
+    # For GCDT: independent heads at each layer L
+    # For U-GCDT: shared head applied at each step K
+    # Loss = sum_{l=1}^{L} MSE(Head_l(x_l), a_true)
     if "intermediate_action_preds" in outputs and aux_deep_supervision:
         intermediate_preds = outputs["intermediate_action_preds"]
-        if len(intermediate_preds) > 1:
-            # Apply loss to all intermediate heads (weighted towards later layers)
-            deep_action_loss = 0.0
-            num_layers = len(intermediate_preds)
-            for i, pred in enumerate(intermediate_preds[:-1]):  # Exclude final (already in action_loss)
-                weight = (i + 1) / num_layers  # Later layers matter more
-                deep_action_loss += weight * jnp.mean((pred - target_actions) ** 2)
-            deep_action_loss /= (num_layers - 1) if num_layers > 1 else 1
-            metrics["deep_action_loss"] = deep_action_loss
-            total_loss += 0.5 * deep_action_loss  # Weighted contribution
+        if len(intermediate_preds) >= 1:
+            # Sum MSE loss from ALL heads/steps (V3 protocol: no weighting)
+            total_loss = 0.0
+            for pred in intermediate_preds:
+                total_loss += jnp.mean((pred - target_actions) ** 2)
+            metrics["deep_action_loss"] = total_loss
+            # Note: action_loss (final head) is already included in intermediate_preds
+        else:
+            total_loss = action_loss
+    else:
+        total_loss = action_loss
 
     # Waypoint auxiliary loss
     if aux_use_waypoint_loss and "waypoint_preds" in outputs:
@@ -449,25 +460,41 @@ def train(config: Config):
         json.dump(config_to_dict(config), f, indent=2)
     
     print(f"Output directory: {output_dir}")
-    print(f"Loading dataset: {config.data.dataset_name}")
-    
-    # Load dataset
-    train_dataset, val_dataset, env_info = load_ogbench_dataset(
-        dataset_name=config.data.dataset_name,
-        dataset_dir=config.data.dataset_dir,
-        context_len=config.training.context_len,
-        goal_sampling=config.data.goal_sampling,
-        min_goal_horizon=config.data.min_goal_horizon,
-        max_goal_horizon=config.data.max_goal_horizon,
-        waypoint_horizon=config.aux.waypoint_horizon,
-    )
-    
+    print(f"Loading dataset: {config.data.dataset_name} (type: {config.data.dataset_type})")
+
+    # Load dataset based on type
+    if config.data.dataset_type == "d4rl":
+        train_dataset, val_dataset, env_info = load_d4rl_dataset(
+            dataset_name=config.data.dataset_name,
+            context_len=config.training.context_len,
+            goal_sampling=config.data.goal_sampling,
+            min_goal_horizon=config.data.min_goal_horizon,
+            max_goal_horizon=config.data.max_goal_horizon,
+            waypoint_horizon=config.aux.waypoint_horizon,
+        )
+        DataLoader = D4RLDataLoader
+        batch_to_jax = d4rl_batch_to_jax
+    else:
+        train_dataset, val_dataset, env_info = load_ogbench_dataset(
+            dataset_name=config.data.dataset_name,
+            dataset_dir=config.data.dataset_dir,
+            context_len=config.training.context_len,
+            goal_sampling=config.data.goal_sampling,
+            min_goal_horizon=config.data.min_goal_horizon,
+            max_goal_horizon=config.data.max_goal_horizon,
+            waypoint_horizon=config.aux.waypoint_horizon,
+        )
+        DataLoader = OGBenchDataLoader
+        batch_to_jax = ogbench_batch_to_jax
+
     # Update config with environment info
     config.state_dim = env_info["state_dim"]
     config.action_dim = env_info["action_dim"]
-    
-    print(f"State dim: {config.state_dim}, Action dim: {config.action_dim}")
-    
+    # For D4RL antmaze, goal_dim may differ from state_dim
+    config.goal_dim = env_info.get("goal_dim", env_info["state_dim"])
+
+    print(f"State dim: {config.state_dim}, Action dim: {config.action_dim}, Goal dim: {config.goal_dim}")
+
     # Create data loaders
     train_loader = DataLoader(
         train_dataset,
@@ -475,7 +502,7 @@ def train(config: Config):
         seed=config.training.seed,
         infinite=True,
     )
-    
+
     val_loader = DataLoader(
         val_dataset,
         batch_size=config.training.batch_size,
@@ -492,6 +519,7 @@ def train(config: Config):
         config,
         config.state_dim,
         config.action_dim,
+        config.goal_dim,
     )
 
     # Multi-GPU: replicate state and create pmap'd train step
