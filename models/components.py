@@ -285,7 +285,7 @@ class RecurrentGate(nn.Module):
             self.hidden_dim,
             name="gate_proj",
             kernel_init=nn.initializers.xavier_uniform(),
-            bias_init=nn.initializers.zeros,
+            bias_init=nn.initializers.constant(-2.0),
         )(gate_input)
 
         # Sigmoid activation to get values in [0, 1]

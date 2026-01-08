@@ -168,8 +168,11 @@ def compute_loss(
         if len(intermediate_preds) >= 1:
             # Sum MSE loss from ALL heads/steps (V3 protocol: no weighting)
             total_loss = 0.0
-            for pred in intermediate_preds:
-                total_loss += jnp.mean((pred - target_actions) ** 2)
+            num_preds = len(intermediate_preds)
+            for k, pred in enumerate(intermediate_preds):
+                # k goes 0..11. Weight goes 1..12
+                step_weight = (k + 1) / num_preds 
+                total_loss += step_weight * jnp.mean((pred - target_actions) ** 2)
             metrics["deep_action_loss"] = total_loss
             # Note: action_loss (final head) is already included in intermediate_preds
         else:
