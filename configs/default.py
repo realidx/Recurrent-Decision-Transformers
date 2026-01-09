@@ -107,6 +107,11 @@ class DataConfig:
     min_goal_horizon: int = 1
     max_goal_horizon: int = 50
 
+    # Hindsight Experience Replay (HER) relabeling probability
+    # 80% of time: use trajectory's FINAL achieved state as goal (enables stitching)
+    # 20% of time: use original goal sampling (maintains global context)
+    her_relabel_prob: float = 0.8
+
 
 @dataclass
 class EvalConfig:

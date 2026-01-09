@@ -471,9 +471,11 @@ def train(config: Config):
             min_goal_horizon=config.data.min_goal_horizon,
             max_goal_horizon=config.data.max_goal_horizon,
             waypoint_horizon=config.aux.waypoint_horizon,
+            her_relabel_prob=config.data.her_relabel_prob,  # HER for stitching
         )
         DataLoader = D4RLDataLoader
         batch_to_jax = d4rl_batch_to_jax
+        print(f"HER relabeling probability: {config.data.her_relabel_prob}")
     else:
         train_dataset, val_dataset, env_info = load_ogbench_dataset(
             dataset_name=config.data.dataset_name,

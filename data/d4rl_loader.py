@@ -47,19 +47,21 @@ class D4RLDataset:
         task_type: str = "antmaze",  # "antmaze" or "kitchen"
         normalize: bool = True,
         norm_stats: Optional[NormalizationStats] = None,
+        her_relabel_prob: float = 0.8,  # HER: probability of relabeling to achieved goal
     ):
         """
         Args:
             dataset: D4RL dataset dict with 'observations', 'actions', 'terminals', etc.
             env: Gym environment for goal extraction
             context_len: Number of (state, action) pairs in context
-            goal_sampling: "future" (sample from same trajectory) or "random"
+            goal_sampling: "future" (sample from same trajectory) or "her" (hindsight relabeling)
             min_goal_horizon: Minimum steps ahead for goal
             max_goal_horizon: Maximum steps ahead for goal
             waypoint_horizon: Steps ahead for waypoint prediction target
             task_type: Type of D4RL task ("antmaze" or "kitchen")
             normalize: Whether to normalize observations and goals
             norm_stats: Pre-computed normalization stats (for val set)
+            her_relabel_prob: Probability of using achieved final state as goal (HER)
         """
         self.observations = dataset["observations"]
         self.actions = dataset["actions"]
@@ -71,6 +73,7 @@ class D4RLDataset:
         self.task_type = task_type
         self.env = env
         self.normalize = normalize
+        self.her_relabel_prob = her_relabel_prob
 
         if task_type == "antmaze":
             # Goals are the target xy position (last 2 dims of observation)
@@ -238,22 +241,36 @@ class D4RLDataset:
             # Target action is the last action in context
             target_action = actions[-1]
 
-            # Sample goal from future in same trajectory
-            if self.goal_sampling == "future":
-                max_horizon = min(self.max_goal_horizon, traj_end - ctx_end)
-                if max_horizon > self.min_goal_horizon:
-                    goal_horizon = rng.integers(self.min_goal_horizon, max_horizon + 1)
-                else:
-                    goal_horizon = max(1, max_horizon)
-                goal_idx = min(ctx_end - 1 + goal_horizon, traj_end - 1)
-                goal = self.achieved_goals[goal_idx]
-            else:
-                # Random goal from dataset
-                goal_idx = rng.integers(0, len(self.achieved_goals))
-                goal = self.achieved_goals[goal_idx]
+            # Goal sampling with Hindsight Experience Replay (HER)
+            # Key insight: 80% of time, use trajectory's FINAL achieved state as goal
+            # This teaches "how to reach where I actually ended up" - enables stitching
+            use_her = rng.random() < self.her_relabel_prob
 
-            # Future state for waypoint loss
-            waypoint_idx = min(ctx_end - 1 + self.waypoint_horizon, traj_end - 1)
+            if use_her:
+                # HER: Use the final achieved state of this trajectory as goal
+                # This is the key to learning from "failed" trajectories
+                final_state_idx = traj_end - 1
+                goal = self.achieved_goals[final_state_idx]
+                # Waypoint should also be relative to where we're heading
+                # Use a state between current position and trajectory end
+                waypoint_idx = min(ctx_end - 1 + self.waypoint_horizon, traj_end - 1)
+            else:
+                # Original behavior: sample future state as goal
+                if self.goal_sampling == "future":
+                    max_horizon = min(self.max_goal_horizon, traj_end - ctx_end)
+                    if max_horizon > self.min_goal_horizon:
+                        goal_horizon = rng.integers(self.min_goal_horizon, max_horizon + 1)
+                    else:
+                        goal_horizon = max(1, max_horizon)
+                    goal_idx = min(ctx_end - 1 + goal_horizon, traj_end - 1)
+                    goal = self.achieved_goals[goal_idx]
+                else:
+                    # Random goal from dataset (for diversity)
+                    goal_idx = rng.integers(0, len(self.achieved_goals))
+                    goal = self.achieved_goals[goal_idx]
+                waypoint_idx = min(ctx_end - 1 + self.waypoint_horizon, traj_end - 1)
+
+            # Future state for waypoint loss (goal-relative planning)
             future_state = self.observations[waypoint_idx]
 
             states_batch.append(states)
