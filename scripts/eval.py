@@ -147,6 +147,8 @@ def run_test_time_scaling_experiment(
 
     Evaluates same model with different numbers of UT iterations.
     """
+    # Convert to absolute path if needed
+    checkpoint_path = os.path.abspath(checkpoint_path)
     print(f"Loading checkpoint from {checkpoint_path}")
 
     # Load environment based on dataset type
