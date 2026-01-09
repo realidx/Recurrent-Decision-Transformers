@@ -43,12 +43,12 @@ def evaluate_d4rl(
 
         # Get goal for antmaze
         if hasattr(env, 'target_goal'):
-            goal = env.target_goal
+            goal = np.array(env.target_goal)
         elif hasattr(env, 'goal'):
-            goal = env.goal
+            goal = np.array(env.goal)
         else:
             # For kitchen or other envs, use observation as goal placeholder
-            goal = obs[:2] if len(obs) >= 2 else obs
+            goal = np.array(obs[:2] if len(obs) >= 2 else obs)
 
         # Context buffers
         states_buffer = [obs]
