@@ -103,12 +103,16 @@ class TokenEmbedding(nn.Module):
             plan_token_idx = 0
         else:
             plan_token_idx = -1
-            
-        # Goal token
-        goal_token = goal_embed[:, None, :]  # (batch, 1, hidden_dim)
+
+        # Goal token - ensure proper 3D shape (batch, 1, hidden_dim)
+        if goal_embed.ndim == 2:
+            goal_token = jnp.expand_dims(goal_embed, axis=1)
+        else:
+            # Already 3D, just ensure middle dim is 1
+            goal_token = goal_embed[:, :1, :]
         tokens.append(goal_token)
         token_types.append(jnp.full((batch_size, 1), 2))  # type 2 = goal
-        
+
         # Interleave states and actions: s_0 a_0 s_1 a_1 ...
         for t in range(seq_len):
             tokens.append(state_embed[:, t:t+1, :])
@@ -118,15 +122,18 @@ class TokenEmbedding(nn.Module):
         
         # Concatenate all tokens
         embeddings = jnp.concatenate(tokens, axis=1)  # (batch, total_len, hidden_dim)
-        token_types = jnp.concatenate(token_types, axis=1)  # (batch, total_len)
-        
+        token_types_concat = jnp.concatenate(token_types, axis=1)  # (batch, total_len)
+
         total_len = embeddings.shape[1]
-        
+
+        # Ensure token_types matches embeddings length (handle any edge cases)
+        token_types_concat = token_types_concat[:, :total_len]
+
         # Add positional embeddings
         embeddings = embeddings + pos_embed[:, :total_len, :]
-        
+
         # Add token type embeddings
-        type_embeds = token_type_embed[token_types]  # (batch, total_len, hidden_dim)
+        type_embeds = token_type_embed[token_types_concat]  # (batch, total_len, hidden_dim)
         embeddings = embeddings + type_embeds
         
         return embeddings, plan_token_idx
@@ -285,7 +292,7 @@ class RecurrentGate(nn.Module):
             self.hidden_dim,
             name="gate_proj",
             kernel_init=nn.initializers.xavier_uniform(),
-            bias_init=nn.initializers.constant(-2.0),
+            bias_init=nn.initializers.zeros,
         )(gate_input)
 
         # Sigmoid activation to get values in [0, 1]

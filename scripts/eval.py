@@ -43,12 +43,12 @@ def evaluate_d4rl(
 
         # Get goal for antmaze
         if hasattr(env, 'target_goal'):
-            goal = env.target_goal
+            goal = np.array(env.target_goal)
         elif hasattr(env, 'goal'):
-            goal = env.goal
+            goal = np.array(env.goal)
         else:
             # For kitchen or other envs, use observation as goal placeholder
-            goal = obs[:2] if len(obs) >= 2 else obs
+            goal = np.array(obs[:2] if len(obs) >= 2 else obs)
 
         # Context buffers
         states_buffer = [obs]
@@ -82,10 +82,12 @@ def evaluate_d4rl(
                         np.array(actions_buffer) if actions_buffer else np.zeros((0, action_dim))
                     ], axis=0)
 
-            # Forward pass
-            states_input = jnp.array(states[None])
-            actions_input = jnp.array(actions[None])
-            goals_input = jnp.array(goal[None])
+            # Forward pass - ensure correct shapes
+            states_input = jnp.array(states[None])  # (1, ctx_len, state_dim)
+            actions_input = jnp.array(actions[None])  # (1, ctx_len, action_dim)
+            # Ensure goal is 2D with batch dimension
+            goal_2d = goal.reshape(1, -1) if goal.ndim == 1 else goal
+            goals_input = jnp.array(goal_2d)  # (1, goal_dim)
             timesteps_input = jnp.arange(ctx_len)[None]
 
             # Build kwargs for model call
@@ -147,6 +149,8 @@ def run_test_time_scaling_experiment(
 
     Evaluates same model with different numbers of UT iterations.
     """
+    # Convert to absolute path if needed
+    checkpoint_path = os.path.abspath(checkpoint_path)
     print(f"Loading checkpoint from {checkpoint_path}")
 
     # Load environment based on dataset type

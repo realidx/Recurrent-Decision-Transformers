@@ -15,7 +15,7 @@ set -e
 TASK="${TASK:-antmaze-umaze-v2}"
 OUTPUT_DIR="${OUTPUT_DIR:-./outputs}"
 SEEDS="${SEEDS:-42 123 456}"
-SKIP_BASELINE="${SKIP_BASELINE:-0}"
+SKIP_BASELINE="${SKIP_BASELINE:-1}"
 
 # V3 Architecture: L=12 layers, K=12 iterations
 # Gated recurrence enabled for U-GCDT
@@ -23,15 +23,15 @@ SKIP_BASELINE="${SKIP_BASELINE:-0}"
 # ============================================
 # FAST_MODE: For quick iteration and debugging
 # ============================================
-FAST_MODE="${FAST_MODE:-0}"
+FAST_MODE="${FAST_MODE:-1}"
 
 if [ "$FAST_MODE" -eq 1 ]; then
     echo ">>> FAST_MODE enabled - reduced settings for quick iteration <<<"
-    export MAX_STEPS="${MAX_STEPS:-25000}"
+    export MAX_STEPS="${MAX_STEPS:-30000}"
     export EVAL_EPISODES="${EVAL_EPISODES:-20}"
-    export EVAL_EVERY="${EVAL_EVERY:-5000}"
+    export EVAL_EVERY="${EVAL_EVERY:-10000}"
     export SAVE_EVERY="${SAVE_EVERY:-10000}"
-    SEEDS="${SEEDS:-42}"
+    export SEEDS="${SEEDS:-42}"
 fi
 
 # Export environment overrides
