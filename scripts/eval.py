@@ -14,324 +14,297 @@ from flax.training import checkpoints
 # Add parent directory to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from configs.default import Config
+from configs.default import Config, ModelConfig, TrainingConfig, DataConfig, AuxiliaryConfig, EvalConfig
 from models import create_model
-from data.ogbench_loader import load_ogbench_dataset
 
 
-def evaluate_with_iterations(
+def evaluate_d4rl(
     state,
     env,
     config: Config,
-    num_iterations: int,
+    num_iterations: int = None,
     num_episodes: int = 100,
     max_steps: int = 1000,
     verbose: bool = False,
 ) -> Dict[str, Any]:
     """
-    Evaluate policy with a specific number of UT iterations.
-    
-    This enables test-time scaling experiments: train with K iterations,
-    evaluate with K' iterations where K' can be different from K.
-    """
-    results_by_task = {}
-    all_successes = []
-    all_steps = []
-    
-    for task_id in range(1, 6):
-        task_successes = 0
-        task_steps = []
-        episodes_per_task = num_episodes // 5
-        
-        for ep in range(episodes_per_task):
-            obs, info = env.reset(options={"task_id": task_id})
-            goal = info["goal"]
-            
-            # Context buffers
-            states_buffer = [obs]
-            actions_buffer = []
-            done = False
-            steps = 0
-            
-            while not done and steps < max_steps:
-                ctx_len = config.training.context_len
-                
-                # Prepare context (same as in train.py)
-                if len(states_buffer) < ctx_len:
-                    pad_len = ctx_len - len(states_buffer)
-                    states = np.array([states_buffer[0]] * pad_len + states_buffer)
-                    if len(actions_buffer) == 0:
-                        actions = np.zeros((ctx_len, env.action_space.shape[0]))
-                    else:
-                        pad_actions = [actions_buffer[0]] * pad_len
-                        actions = np.array(pad_actions + actions_buffer)
-                        actions = actions[-ctx_len:]
-                else:
-                    states = np.array(states_buffer[-ctx_len:])
-                    actions = np.array(actions_buffer[-ctx_len:] if len(actions_buffer) >= ctx_len 
-                                      else [np.zeros(env.action_space.shape[0])] * (ctx_len - len(actions_buffer)) + actions_buffer)
-                
-                # Forward pass with specified number of iterations
-                states_input = jnp.array(states[None])
-                actions_input = jnp.array(actions[None])
-                goals_input = jnp.array(goal[None])
-                timesteps_input = jnp.arange(ctx_len)[None]
-                
-                outputs = state.apply_fn(
-                    state.params,
-                    states=states_input,
-                    actions=actions_input,
-                    goals=goals_input,
-                    timesteps=timesteps_input,
-                    num_iterations=num_iterations,  # Override iterations
-                    deterministic=True,
-                )
-                
-                action = np.array(outputs["action_pred"][0])
-                action = np.clip(action, env.action_space.low, env.action_space.high)
-                
-                obs, reward, terminated, truncated, info = env.step(action)
-                done = terminated or truncated
-                
-                states_buffer.append(obs)
-                actions_buffer.append(action)
-                steps += 1
-                
-                if info.get("success", False):
-                    task_successes += 1
-                    task_steps.append(steps)
-                    break
-            
-            if not info.get("success", False):
-                task_steps.append(max_steps)
-        
-        success_rate = task_successes / episodes_per_task
-        results_by_task[f"task_{task_id}"] = {
-            "success_rate": success_rate,
-            "avg_steps": np.mean(task_steps),
-            "num_episodes": episodes_per_task,
-        }
-        all_successes.append(success_rate)
-        all_steps.extend(task_steps)
-        
-        if verbose:
-            print(f"  Task {task_id}: success={success_rate:.3f}, avg_steps={np.mean(task_steps):.1f}")
-    
-    return {
-        "num_iterations": num_iterations,
-        "overall_success_rate": np.mean(all_successes),
-        "overall_avg_steps": np.mean(all_steps),
-        "results_by_task": results_by_task,
-    }
+    Evaluate policy on D4RL environment.
 
+    For antmaze: goal is target_goal from env
+    For kitchen: uses task completion
+    """
+    successes = []
+    steps_list = []
 
-def evaluate_goal_distance_buckets(
-    state,
-    env,
-    config: Config,
-    num_iterations: int,
-    distance_buckets: List[int] = [10, 25, 50, 100],
-    episodes_per_bucket: int = 20,
-    max_steps: int = 1000,
-) -> Dict[str, Any]:
-    """
-    Evaluate performance stratified by goal distance.
-    
-    This tests whether UT helps more for longer-horizon goals.
-    """
-    # Note: This requires custom goal sampling based on distance
-    # For now, we use the standard tasks but track the actual distances
-    
-    results = {}
-    
-    # Standard evaluation
-    for task_id in range(1, 6):
-        task_results = []
-        
-        for ep in range(episodes_per_bucket):
-            obs, info = env.reset(options={"task_id": task_id})
-            goal = info["goal"]
-            
-            # Estimate goal distance (L2 for simplicity)
-            initial_distance = np.linalg.norm(obs[:2] - goal[:2])  # Assume first 2 dims are position
-            
-            states_buffer = [obs]
-            actions_buffer = []
-            done = False
-            steps = 0
-            success = False
-            
-            while not done and steps < max_steps:
-                ctx_len = config.training.context_len
-                
-                if len(states_buffer) < ctx_len:
-                    pad_len = ctx_len - len(states_buffer)
-                    states = np.array([states_buffer[0]] * pad_len + states_buffer)
-                    actions = np.zeros((ctx_len, env.action_space.shape[0]))
-                    if actions_buffer:
-                        actions[-len(actions_buffer):] = np.array(actions_buffer)
+    for ep in range(num_episodes):
+        obs = env.reset()
+        if isinstance(obs, tuple):
+            obs = obs[0]  # Handle new gym API
+
+        # Get goal for antmaze
+        if hasattr(env, 'target_goal'):
+            goal = env.target_goal
+        elif hasattr(env, 'goal'):
+            goal = env.goal
+        else:
+            # For kitchen or other envs, use observation as goal placeholder
+            goal = obs[:2] if len(obs) >= 2 else obs
+
+        # Context buffers
+        states_buffer = [obs]
+        actions_buffer = []
+        done = False
+        steps = 0
+        success = False
+
+        while not done and steps < max_steps:
+            ctx_len = config.training.context_len
+            action_dim = env.action_space.shape[0]
+
+            # Prepare context
+            if len(states_buffer) < ctx_len:
+                pad_len = ctx_len - len(states_buffer)
+                states = np.array([states_buffer[0]] * pad_len + list(states_buffer))
+                if len(actions_buffer) == 0:
+                    actions = np.zeros((ctx_len, action_dim))
                 else:
-                    states = np.array(states_buffer[-ctx_len:])
-                    actions = np.array(actions_buffer[-ctx_len:] if len(actions_buffer) >= ctx_len 
-                                      else [np.zeros(env.action_space.shape[0])] * (ctx_len - len(actions_buffer)) + actions_buffer)
-                
-                states_input = jnp.array(states[None])
-                actions_input = jnp.array(actions[None])
-                goals_input = jnp.array(goal[None])
-                timesteps_input = jnp.arange(ctx_len)[None]
-                
-                outputs = state.apply_fn(
-                    state.params,
-                    states=states_input,
-                    actions=actions_input,
-                    goals=goals_input,
-                    timesteps=timesteps_input,
-                    num_iterations=num_iterations,
-                    deterministic=True,
-                )
-                
-                action = np.array(outputs["action_pred"][0])
-                action = np.clip(action, env.action_space.low, env.action_space.high)
-                
-                obs, reward, terminated, truncated, info = env.step(action)
-                done = terminated or truncated
-                
-                states_buffer.append(obs)
-                actions_buffer.append(action)
-                steps += 1
-                
-                if info.get("success", False):
-                    success = True
-                    break
-            
-            task_results.append({
-                "initial_distance": initial_distance,
-                "success": success,
-                "steps": steps,
-            })
-        
-        results[f"task_{task_id}"] = task_results
-    
-    # Aggregate by distance buckets
-    all_results = []
-    for task_results in results.values():
-        all_results.extend(task_results)
-    
-    bucket_results = {}
-    prev_threshold = 0
-    for threshold in distance_buckets:
-        bucket_data = [r for r in all_results 
-                      if prev_threshold <= r["initial_distance"] < threshold]
-        if bucket_data:
-            bucket_results[f"dist_{prev_threshold}_{threshold}"] = {
-                "success_rate": np.mean([r["success"] for r in bucket_data]),
-                "avg_steps": np.mean([r["steps"] for r in bucket_data]),
-                "num_episodes": len(bucket_data),
+                    pad_actions = [actions_buffer[0]] * pad_len
+                    actions = np.array(pad_actions + list(actions_buffer))
+                    actions = actions[-ctx_len:]
+            else:
+                states = np.array(states_buffer[-ctx_len:])
+                if len(actions_buffer) >= ctx_len:
+                    actions = np.array(actions_buffer[-ctx_len:])
+                else:
+                    pad_len = ctx_len - len(actions_buffer)
+                    actions = np.concatenate([
+                        np.zeros((pad_len, action_dim)),
+                        np.array(actions_buffer) if actions_buffer else np.zeros((0, action_dim))
+                    ], axis=0)
+
+            # Forward pass
+            states_input = jnp.array(states[None])
+            actions_input = jnp.array(actions[None])
+            goals_input = jnp.array(goal[None])
+            timesteps_input = jnp.arange(ctx_len)[None]
+
+            # Build kwargs for model call
+            call_kwargs = {
+                "states": states_input,
+                "actions": actions_input,
+                "goals": goals_input,
+                "timesteps": timesteps_input,
+                "deterministic": True,
             }
-        prev_threshold = threshold
-    
-    # Handle > max threshold
-    bucket_data = [r for r in all_results if r["initial_distance"] >= distance_buckets[-1]]
-    if bucket_data:
-        bucket_results[f"dist_{distance_buckets[-1]}_plus"] = {
-            "success_rate": np.mean([r["success"] for r in bucket_data]),
-            "avg_steps": np.mean([r["steps"] for r in bucket_data]),
-            "num_episodes": len(bucket_data),
-        }
-    
+            # Only pass num_iterations for UT models (not GCDT baseline)
+            if num_iterations is not None and config.model.use_weight_tying:
+                call_kwargs["num_iterations"] = num_iterations
+
+            outputs = state.apply_fn(state.params, **call_kwargs)
+
+            action = np.array(outputs["action_pred"][0])
+            action = np.clip(action, env.action_space.low, env.action_space.high)
+
+            # Step environment
+            step_result = env.step(action)
+            if len(step_result) == 5:
+                obs, reward, terminated, truncated, info = step_result
+                done = terminated or truncated
+            else:
+                obs, reward, done, info = step_result
+
+            states_buffer.append(obs)
+            actions_buffer.append(action)
+            steps += 1
+
+            # Check success
+            if info.get("success", False) or reward > 0:
+                success = True
+                break
+
+        successes.append(float(success))
+        steps_list.append(steps)
+
+        if verbose and (ep + 1) % 10 == 0:
+            print(f"  Episode {ep + 1}/{num_episodes}: success_rate={np.mean(successes):.3f}")
+
     return {
         "num_iterations": num_iterations,
-        "bucket_results": bucket_results,
-        "raw_results": results,
+        "success_rate": np.mean(successes),
+        "avg_steps": np.mean(steps_list),
+        "num_episodes": num_episodes,
     }
 
 
 def run_test_time_scaling_experiment(
     checkpoint_path: str,
     config: Config,
-    test_iterations: List[int] = [2, 4, 6, 8],
+    test_iterations: List[int] = [6, 12, 18, 24],
     num_episodes: int = 100,
 ) -> Dict[str, Any]:
     """
     Run test-time scaling experiment.
-    
+
     Evaluates same model with different numbers of UT iterations.
     """
     print(f"Loading checkpoint from {checkpoint_path}")
-    
-    # Load dataset info
-    _, _, env_info = load_ogbench_dataset(
-        dataset_name=config.data.dataset_name,
-        dataset_dir=config.data.dataset_dir,
-        context_len=config.training.context_len,
-    )
-    
-    config.state_dim = env_info["state_dim"]
-    config.action_dim = env_info["action_dim"]
-    
+
+    # Load environment based on dataset type
+    dataset_type = getattr(config.data, 'dataset_type', 'd4rl')
+    dataset_name = config.data.dataset_name
+
+    if dataset_type == "d4rl":
+        import gym
+        import d4rl
+        env = gym.make(dataset_name)
+        state_dim = env.observation_space.shape[0]
+        action_dim = env.action_space.shape[0]
+        # Goal dim for antmaze is 2 (target xy)
+        if "antmaze" in dataset_name:
+            goal_dim = 2
+        else:
+            goal_dim = state_dim
+    else:
+        from data.ogbench_loader import load_ogbench_dataset
+        _, _, env_info = load_ogbench_dataset(
+            dataset_name=dataset_name,
+            dataset_dir=config.data.dataset_dir,
+            context_len=config.training.context_len,
+        )
+        env = env_info["env"]
+        state_dim = env_info["state_dim"]
+        action_dim = env_info["action_dim"]
+        goal_dim = state_dim
+
+    config.state_dim = state_dim
+    config.action_dim = action_dim
+    config.goal_dim = goal_dim
+
+    print(f"Environment: {dataset_name}")
+    print(f"State dim: {state_dim}, Action dim: {action_dim}, Goal dim: {goal_dim}")
+
     # Create model
     model = create_model(config)
-    
+
     # Load checkpoint
-    state = checkpoints.restore_checkpoint(checkpoint_path, target=None)
-    
+    ckpt = checkpoints.restore_checkpoint(checkpoint_path, target=None)
+
     # Create a proper TrainState for apply_fn
     from scripts.train import create_train_state
     rng = jax.random.PRNGKey(0)
     dummy_state = create_train_state(
-        rng, model, config, config.state_dim, config.action_dim
+        rng, model, config, state_dim, action_dim, goal_dim
     )
     # Replace params with loaded params
-    state = dummy_state.replace(params=state["params"])
-    
+    state = dummy_state.replace(params=ckpt["params"])
+
     results = {}
-    
+
     print(f"\nRunning test-time scaling experiment...")
     print(f"Test iterations: {test_iterations}")
-    
+    print(f"Model type: {'U-GCDT' if config.model.use_weight_tying else 'GCDT baseline'}")
+
     for num_iter in test_iterations:
         print(f"\nEvaluating with {num_iter} iterations...")
-        
-        eval_result = evaluate_with_iterations(
+
+        eval_result = evaluate_d4rl(
             state,
-            env_info["env"],
+            env,
             config,
             num_iterations=num_iter,
             num_episodes=num_episodes,
             verbose=True,
         )
-        
+
         results[f"iter_{num_iter}"] = eval_result
-        print(f"  Overall: success={eval_result['overall_success_rate']:.3f}, "
-              f"avg_steps={eval_result['overall_avg_steps']:.1f}")
-    
+        print(f"  Result: success_rate={eval_result['success_rate']:.3f}, "
+              f"avg_steps={eval_result['avg_steps']:.1f}")
+
     return results
+
+
+def load_config_from_json(config_path: str) -> Config:
+    """Load config from saved JSON file."""
+    with open(config_path, "r") as f:
+        config_dict = json.load(f)
+
+    # Reconstruct config from dict
+    config = Config()
+
+    # Update model config
+    if "model" in config_dict:
+        for key, value in config_dict["model"].items():
+            if hasattr(config.model, key):
+                setattr(config.model, key, value)
+
+    # Update training config
+    if "training" in config_dict:
+        for key, value in config_dict["training"].items():
+            if hasattr(config.training, key):
+                setattr(config.training, key, value)
+
+    # Update data config
+    if "data" in config_dict:
+        for key, value in config_dict["data"].items():
+            if hasattr(config.data, key):
+                setattr(config.data, key, value)
+
+    # Update aux config
+    if "aux" in config_dict:
+        for key, value in config_dict["aux"].items():
+            if hasattr(config.aux, key):
+                setattr(config.aux, key, value)
+
+    # Update eval config
+    if "eval" in config_dict:
+        for key, value in config_dict["eval"].items():
+            if hasattr(config.eval, key):
+                setattr(config.eval, key, value)
+
+    # Top level fields
+    if "exp_name" in config_dict:
+        config.exp_name = config_dict["exp_name"]
+    if "output_dir" in config_dict:
+        config.output_dir = config_dict["output_dir"]
+
+    return config
 
 
 def main():
     import argparse
-    
-    parser = argparse.ArgumentParser()
+
+    parser = argparse.ArgumentParser(description="Evaluate UT-GCDT models with test-time scaling")
     parser.add_argument("--checkpoint", type=str, required=True,
                        help="Path to checkpoint directory")
     parser.add_argument("--config_path", type=str, default=None,
                        help="Path to config.json (if not in checkpoint dir)")
-    parser.add_argument("--test_iterations", type=int, nargs="+", default=[2, 4, 6, 8],
+    parser.add_argument("--test_iterations", type=int, nargs="+", default=[6, 12, 18, 24],
                        help="Number of iterations to test")
-    parser.add_argument("--num_episodes", type=int, default=100)
-    parser.add_argument("--output", type=str, default="eval_results.json")
+    parser.add_argument("--num_episodes", type=int, default=100,
+                       help="Number of episodes for evaluation")
+    parser.add_argument("--output", type=str, default=None,
+                       help="Output file for results (default: eval_results.json in checkpoint dir)")
     args = parser.parse_args()
-    
-    # Load config
-    config_path = args.config_path or os.path.join(args.checkpoint, "config.json")
-    with open(config_path, "r") as f:
-        config_dict = json.load(f)
-    
-    # Reconstruct config (simplified - in practice you'd want proper serialization)
-    from configs.default import Config
-    config = Config()
-    # Update config from dict...
-    
+
+    # Find config file
+    if args.config_path:
+        config_path = args.config_path
+    else:
+        # Look in checkpoint directory
+        if os.path.isdir(args.checkpoint):
+            config_path = os.path.join(args.checkpoint, "config.json")
+        else:
+            # Checkpoint is a file, look in parent directory
+            config_path = os.path.join(os.path.dirname(args.checkpoint), "config.json")
+
+    if not os.path.exists(config_path):
+        print(f"Error: Config file not found at {config_path}")
+        print("Please specify --config_path")
+        sys.exit(1)
+
+    print(f"Loading config from {config_path}")
+    config = load_config_from_json(config_path)
+
     # Run experiment
     results = run_test_time_scaling_experiment(
         args.checkpoint,
@@ -339,12 +312,25 @@ def main():
         test_iterations=args.test_iterations,
         num_episodes=args.num_episodes,
     )
-    
+
     # Save results
-    with open(args.output, "w") as f:
+    if args.output:
+        output_path = args.output
+    else:
+        if os.path.isdir(args.checkpoint):
+            output_path = os.path.join(args.checkpoint, "eval_results.json")
+        else:
+            output_path = os.path.join(os.path.dirname(args.checkpoint), "eval_results.json")
+
+    with open(output_path, "w") as f:
         json.dump(results, f, indent=2)
-    
-    print(f"\nResults saved to {args.output}")
+
+    print(f"\n{'='*50}")
+    print("RESULTS SUMMARY")
+    print(f"{'='*50}")
+    for key, val in results.items():
+        print(f"{key}: success_rate={val['success_rate']:.3f}, avg_steps={val['avg_steps']:.1f}")
+    print(f"\nResults saved to {output_path}")
 
 
 if __name__ == "__main__":
