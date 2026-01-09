@@ -104,8 +104,8 @@ class TokenEmbedding(nn.Module):
         else:
             plan_token_idx = -1
             
-        # Goal token
-        goal_token = goal_embed[:, None, :]  # (batch, 1, hidden_dim)
+        # Goal token - use expand_dims for explicit shape handling
+        goal_token = jnp.expand_dims(goal_embed, axis=1)  # (batch, 1, hidden_dim)
         tokens.append(goal_token)
         token_types.append(jnp.full((batch_size, 1), 2))  # type 2 = goal
         

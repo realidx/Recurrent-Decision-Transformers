@@ -82,10 +82,12 @@ def evaluate_d4rl(
                         np.array(actions_buffer) if actions_buffer else np.zeros((0, action_dim))
                     ], axis=0)
 
-            # Forward pass
-            states_input = jnp.array(states[None])
-            actions_input = jnp.array(actions[None])
-            goals_input = jnp.array(goal[None])
+            # Forward pass - ensure correct shapes
+            states_input = jnp.array(states[None])  # (1, ctx_len, state_dim)
+            actions_input = jnp.array(actions[None])  # (1, ctx_len, action_dim)
+            # Ensure goal is 2D with batch dimension
+            goal_2d = goal.reshape(1, -1) if goal.ndim == 1 else goal
+            goals_input = jnp.array(goal_2d)  # (1, goal_dim)
             timesteps_input = jnp.arange(ctx_len)[None]
 
             # Build kwargs for model call
