@@ -26,6 +26,7 @@ def evaluate_d4rl(
     num_episodes: int = 100,
     max_steps: int = 1000,
     verbose: bool = False,
+    norm_stats: Dict[str, np.ndarray] = None,
 ) -> Dict[str, Any]:
     """
     Evaluate policy on D4RL environment.
@@ -82,11 +83,19 @@ def evaluate_d4rl(
                         np.array(actions_buffer) if actions_buffer else np.zeros((0, action_dim))
                     ], axis=0)
 
+            # Apply normalization if available
+            if norm_stats is not None:
+                states_norm = (states - norm_stats["obs_mean"]) / norm_stats["obs_std"]
+                goal_norm = (goal - norm_stats["goal_mean"]) / norm_stats["goal_std"]
+            else:
+                states_norm = states
+                goal_norm = goal
+
             # Forward pass - ensure correct shapes
-            states_input = jnp.array(states[None])  # (1, ctx_len, state_dim)
+            states_input = jnp.array(states_norm[None])  # (1, ctx_len, state_dim)
             actions_input = jnp.array(actions[None])  # (1, ctx_len, action_dim)
-            # Ensure goal is 2D with batch dimension
-            goal_2d = goal.reshape(1, -1) if goal.ndim == 1 else goal
+            # Ensure goal is 2D with batch dimension (use normalized goal)
+            goal_2d = goal_norm.reshape(1, -1) if goal_norm.ndim == 1 else goal_norm
             goals_input = jnp.array(goal_2d)  # (1, goal_dim)
             timesteps_input = jnp.arange(ctx_len)[None]
 
@@ -187,6 +196,26 @@ def run_test_time_scaling_experiment(
     print(f"Environment: {dataset_name}")
     print(f"State dim: {state_dim}, Action dim: {action_dim}, Goal dim: {goal_dim}")
 
+    # Load normalization stats if available
+    norm_stats = None
+    norm_stats_path = os.path.join(checkpoint_path, "norm_stats.npz")
+    if not os.path.exists(norm_stats_path):
+        # Check parent directory (checkpoint_path might be a file)
+        norm_stats_path = os.path.join(os.path.dirname(checkpoint_path), "norm_stats.npz")
+
+    if os.path.exists(norm_stats_path):
+        norm_data = np.load(norm_stats_path)
+        norm_stats = {
+            "obs_mean": norm_data["obs_mean"],
+            "obs_std": norm_data["obs_std"],
+            "goal_mean": norm_data["goal_mean"],
+            "goal_std": norm_data["goal_std"],
+        }
+        print(f"Loaded normalization stats from {norm_stats_path}")
+        print(f"  Goal mean: {norm_stats['goal_mean']}, Goal std: {norm_stats['goal_std']}")
+    else:
+        print("Warning: No normalization stats found. Using unnormalized inputs.")
+
     # Create model
     model = create_model(config)
 
@@ -218,6 +247,7 @@ def run_test_time_scaling_experiment(
             num_iterations=num_iter,
             num_episodes=num_episodes,
             verbose=True,
+            norm_stats=norm_stats,
         )
 
         results[f"iter_{num_iter}"] = eval_result

@@ -495,6 +495,18 @@ def train(config: Config):
 
     print(f"State dim: {config.state_dim}, Action dim: {config.action_dim}, Goal dim: {config.goal_dim}")
 
+    # Save normalization stats for eval
+    if "norm_stats" in env_info and env_info["norm_stats"] is not None:
+        norm_stats = env_info["norm_stats"]
+        np.savez(
+            os.path.join(output_dir, "norm_stats.npz"),
+            obs_mean=norm_stats.obs_mean,
+            obs_std=norm_stats.obs_std,
+            goal_mean=norm_stats.goal_mean,
+            goal_std=norm_stats.goal_std,
+        )
+        print(f"Saved normalization stats to {output_dir}/norm_stats.npz")
+
     # Create data loaders
     train_loader = DataLoader(
         train_dataset,
