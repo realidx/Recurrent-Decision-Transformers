@@ -168,11 +168,8 @@ def compute_loss(
         if len(intermediate_preds) >= 1:
             # Sum MSE loss from ALL heads/steps (V3 protocol: no weighting)
             total_loss = 0.0
-            num_preds = len(intermediate_preds)
-            for k, pred in enumerate(intermediate_preds):
-                # k goes 0..11. Weight goes 1..12
-                step_weight = (k + 1) / num_preds 
-            total_loss += step_weight * jnp.mean((pred - target_actions) ** 2)
+            for pred in intermediate_preds:
+                total_loss += jnp.mean((pred - target_actions) ** 2)
             metrics["deep_action_loss"] = total_loss
             # Note: action_loss (final head) is already included in intermediate_preds
         else:
@@ -318,221 +315,44 @@ def evaluate_policy(
 ) -> Dict[str, float]:
     """
     Evaluate policy in environment.
-
-    Notes:
-      - Supports both Gym (0.23-style) and Gymnasium (0.26-style) reset/step APIs.
-      - Supports both OGBench multi-task eval (task_id via reset(options=...)) and
-        D4RL single-task envs (no task_id, no info["goal"]).
+    
+    Returns:
+        Dictionary with success_rate, avg_steps, etc.
     """
-    def _unwrap_env(e):
-        # Unwrap common wrapper attributes to reach the base env
-        seen = set()
-        while True:
-            if id(e) in seen:
-                break
-            seen.add(id(e))
-            if hasattr(e, "_wrapped_env"):
-                e = getattr(e, "_wrapped_env")
-                continue
-            if hasattr(e, "unwrapped"):
-                # gym's unwrapped returns base env but may not remove all wrappers
-                base = getattr(e, "unwrapped")
-                if base is not e:
-                    e = base
-                    continue
-            if hasattr(e, "env"):
-                base = getattr(e, "env")
-                if base is not e:
-                    e = base
-                    continue
-            break
-        return e
-
-    def _obs_to_vec(obs):
-        # Some goal envs return dict observations (Gymnasium-style)
-        if isinstance(obs, dict):
-            for k in ("observation", "obs", "state"):
-                if k in obs:
-                    return obs[k]
-            # Fall back to first array-like value
-            for v in obs.values():
-                if hasattr(v, "shape"):
-                    return v
-        return obs
-
-    def _safe_reset(e, **kwargs):
-        # Drop unsupported kwargs (e.g., D4RL AntMaze doesn't accept options)
-        try:
-            out = e.reset(**kwargs)
-        except TypeError:
-            out = e.reset()
-
-        # Gymnasium reset -> (obs, info); old Gym reset -> obs
-        if isinstance(out, tuple) and len(out) == 2 and isinstance(out[1], dict):
-            obs, info = out
-        else:
-            obs, info = out, {}
-        return _obs_to_vec(obs), info
-
-    def _safe_step(e, action):
-        out = e.step(action)
-        # Gymnasium step -> (obs, reward, terminated, truncated, info)
-        if isinstance(out, tuple) and len(out) == 5:
-            obs, reward, terminated, truncated, info = out
-            done = bool(terminated) or bool(truncated)
-            return _obs_to_vec(obs), float(reward), done, info
-        # Old Gym step -> (obs, reward, done, info)
-        obs, reward, done, info = out
-        return _obs_to_vec(obs), float(reward), bool(done), info
-
-    def _is_success(info: Dict[str, Any]) -> bool:
-        if not isinstance(info, dict):
-            return False
-        for k in ("success", "is_success", "goal_achieved"):
-            if k in info:
-                try:
-                    return bool(info[k])
-                except Exception:
-                    pass
-        return False
-
-    def _get_goal(e, obs, info) -> np.ndarray:
-        # 1) If info provides it (OGBench-style)
-        if isinstance(info, dict) and "goal" in info:
-            g = np.asarray(info["goal"], dtype=np.float32).reshape(-1)
-            return g
-
-        # 2) If obs is dict (Gymnasium goal envs)
-        if isinstance(obs, dict):
-            for k in ("desired_goal", "goal"):
-                if k in obs:
-                    g = np.asarray(obs[k], dtype=np.float32).reshape(-1)
-                    return g
-
-        # 3) Try common D4RL AntMaze attributes
-        base = _unwrap_env(e)
-        for attr in ("target_goal", "_target_goal", "goal", "_goal", "_target", "target"):
-            if hasattr(base, attr):
-                g = np.asarray(getattr(base, attr), dtype=np.float32).reshape(-1)
-                if g.size > 0:
-                    return g
-
-        # 4) Fallback (keeps eval running, but goal-conditioned policy may be meaningless)
-        return np.zeros((int(getattr(config, "goal_dim", 0) or 0),), dtype=np.float32)
-
-    # ---- evaluation ----
     successes = []
     steps_list = []
-    per_task_success = []
-
-    dataset_type = getattr(config.data, "dataset_type", None)
-
-    if dataset_type == "d4rl":
-        # Single-task evaluation (no task_id; goal is env internal)
-        for _ in range(num_episodes):
-            obs, info = _safe_reset(env)
-            goal = _get_goal(env, obs, info)
-
-            states_buffer = [obs]
-            actions_buffer = []
-            done = False
-            steps = 0
-            success = False
-
-            while (not done) and steps < max_steps:
-                ctx_len = config.training.context_len
-                action_dim = env.action_space.shape[0]
-
-                states_arr = np.array(states_buffer, dtype=np.float32)
-                if actions_buffer:
-                    actions_arr = np.array(actions_buffer, dtype=np.float32)
-                    actions_seq = np.concatenate([actions_arr, np.zeros((1, action_dim), dtype=np.float32)], axis=0)
-                    pad_action = np.array(actions_buffer[0], dtype=np.float32)
-                else:
-                    actions_seq = np.zeros((1, action_dim), dtype=np.float32)
-                    pad_action = np.zeros((action_dim,), dtype=np.float32)
-
-                if len(states_buffer) < ctx_len:
-                    pad_len = ctx_len - len(states_buffer)
-                    state_pad = np.repeat(states_arr[0:1], pad_len, axis=0)
-                    states = np.concatenate([state_pad, states_arr], axis=0)
-
-                    action_pad = np.repeat(pad_action[None, :], pad_len, axis=0)
-                    actions = np.concatenate([action_pad, actions_seq], axis=0)
-                else:
-                    states = states_arr[-ctx_len:]
-                    actions = actions_seq[-ctx_len:]
-
-                states_input = jnp.array(states[None])
-                actions_input = jnp.array(actions[None])
-                goals_input = jnp.array(np.asarray(goal, dtype=np.float32)[None])
-                timesteps_input = jnp.arange(ctx_len)[None]
-
-                outputs = state.apply_fn(
-                    state.params,
-                    states=states_input,
-                    actions=actions_input,
-                    goals=goals_input,
-                    timesteps=timesteps_input,
-                    deterministic=True,
-                )
-                action = np.array(outputs["action_pred"][0])
-
-                action = np.clip(action, env.action_space.low, env.action_space.high)
-
-                obs, reward, done, info = _safe_step(env, action)
-
-                states_buffer.append(obs)
-                actions_buffer.append(action)
-                steps += 1
-
-                if _is_success(info):
-                    success = True
-                    break
-
-            successes.append(1.0 if success else 0.0)
-            steps_list.append(steps if success else max_steps)
-
-        sr = float(np.mean(successes)) if successes else 0.0
-        per_task_success = [sr]
-        return {
-            "success_rate": sr,
-            "avg_steps": float(np.mean(steps_list)) if steps_list else float(max_steps),
-            "success_per_task": per_task_success,
-        }
-
-    # ---- OGBench multi-task evaluation (default) ----
-    # OGBench has 5 evaluation tasks by convention
-    for task_id in range(1, 6):
+    
+    for task_id in range(1, 6):  # OGBench has 5 evaluation tasks
         task_successes = 0
         task_steps = []
-
-        # distribute episodes across tasks
-        episodes_this_task = max(1, num_episodes // 5)
-        for _ in range(episodes_this_task):
-            obs, info = _safe_reset(env, options={"task_id": task_id})
-            goal = _get_goal(env, obs, info)
-
+        
+        for _ in range(num_episodes // 5):
+            obs, info = env.reset(options={"task_id": task_id})
+            goal = info["goal"]
+            
+            # Initialize context buffers
             states_buffer = [obs]
             actions_buffer = []
             done = False
             steps = 0
-            success = False
-
-            while (not done) and steps < max_steps:
+            
+            while not done and steps < max_steps:
+                # Prepare input for model
+                # Pad context if needed
                 ctx_len = config.training.context_len
                 action_dim = env.action_space.shape[0]
 
-                states_arr = np.array(states_buffer, dtype=np.float32)
+                states_arr = np.array(states_buffer)
                 if actions_buffer:
-                    actions_arr = np.array(actions_buffer, dtype=np.float32)
-                    actions_seq = np.concatenate([actions_arr, np.zeros((1, action_dim), dtype=np.float32)], axis=0)
-                    pad_action = np.array(actions_buffer[0], dtype=np.float32)
+                    actions_arr = np.array(actions_buffer)
+                    actions_seq = np.concatenate([actions_arr, np.zeros((1, action_dim))], axis=0)
+                    pad_action = np.array(actions_buffer[0])
                 else:
-                    actions_seq = np.zeros((1, action_dim), dtype=np.float32)
-                    pad_action = np.zeros((action_dim,), dtype=np.float32)
+                    actions_seq = np.zeros((1, action_dim))
+                    pad_action = np.zeros(action_dim)
 
                 if len(states_buffer) < ctx_len:
+                    # Pad with first observation/action
                     pad_len = ctx_len - len(states_buffer)
                     state_pad = np.repeat(states_arr[0:1], pad_len, axis=0)
                     states = np.concatenate([state_pad, states_arr], axis=0)
@@ -542,12 +362,14 @@ def evaluate_policy(
                 else:
                     states = states_arr[-ctx_len:]
                     actions = actions_seq[-ctx_len:]
-
+                
+                # Add batch dimension
                 states_input = jnp.array(states[None])
                 actions_input = jnp.array(actions[None])
-                goals_input = jnp.array(np.asarray(goal, dtype=np.float32)[None])
+                goals_input = jnp.array(goal[None])
                 timesteps_input = jnp.arange(ctx_len)[None]
-
+                
+                # Get action prediction
                 outputs = state.apply_fn(
                     state.params,
                     states=states_input,
@@ -557,31 +379,37 @@ def evaluate_policy(
                     deterministic=True,
                 )
                 action = np.array(outputs["action_pred"][0])
+                
+                # Clip action to valid range
                 action = np.clip(action, env.action_space.low, env.action_space.high)
-
-                obs, reward, done, info = _safe_step(env, action)
-
+                
+                # Step environment
+                obs, reward, terminated, truncated, info = env.step(action)
+                done = terminated or truncated
+                
+                # Update buffers
                 states_buffer.append(obs)
                 actions_buffer.append(action)
                 steps += 1
-
-                if _is_success(info):
-                    success = True
+                
+                if info.get("success", False):
                     task_successes += 1
                     task_steps.append(steps)
                     break
-
-            if not success:
+            
+            if not info.get("success", False):
                 task_steps.append(max_steps)
-
-        per_task_success.append(task_successes / float(episodes_this_task))
+        
+        successes.append(task_successes / (num_episodes // 5))
         steps_list.extend(task_steps)
-
+    
     return {
-        "success_rate": float(np.mean(per_task_success)) if per_task_success else 0.0,
-        "avg_steps": float(np.mean(steps_list)) if steps_list else float(max_steps),
-        "success_per_task": per_task_success,
+        "success_rate": np.mean(successes),
+        "avg_steps": np.mean(steps_list),
+        "success_per_task": successes,
     }
+
+
 def train(config: Config):
     """Main training loop with multi-GPU support."""
 
@@ -643,9 +471,11 @@ def train(config: Config):
             min_goal_horizon=config.data.min_goal_horizon,
             max_goal_horizon=config.data.max_goal_horizon,
             waypoint_horizon=config.aux.waypoint_horizon,
+            her_relabel_prob=config.data.her_relabel_prob,  # HER for stitching
         )
         DataLoader = D4RLDataLoader
         batch_to_jax = d4rl_batch_to_jax
+        print(f"HER relabeling probability: {config.data.her_relabel_prob}")
     else:
         train_dataset, val_dataset, env_info = load_ogbench_dataset(
             dataset_name=config.data.dataset_name,
@@ -666,6 +496,18 @@ def train(config: Config):
     config.goal_dim = env_info.get("goal_dim", env_info["state_dim"])
 
     print(f"State dim: {config.state_dim}, Action dim: {config.action_dim}, Goal dim: {config.goal_dim}")
+
+    # Save normalization stats for eval
+    if "norm_stats" in env_info and env_info["norm_stats"] is not None:
+        norm_stats = env_info["norm_stats"]
+        np.savez(
+            os.path.join(output_dir, "norm_stats.npz"),
+            obs_mean=norm_stats.obs_mean,
+            obs_std=norm_stats.obs_std,
+            goal_mean=norm_stats.goal_mean,
+            goal_std=norm_stats.goal_std,
+        )
+        print(f"Saved normalization stats to {output_dir}/norm_stats.npz")
 
     # Create data loaders
     train_loader = DataLoader(

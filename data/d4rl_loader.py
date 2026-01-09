@@ -7,6 +7,15 @@ from dataclasses import dataclass
 
 
 @dataclass
+class NormalizationStats:
+    """Statistics for normalizing observations."""
+    obs_mean: np.ndarray
+    obs_std: np.ndarray
+    goal_mean: np.ndarray  # For antmaze: just xy coords
+    goal_std: np.ndarray
+
+
+@dataclass
 class TrajectoryBatch:
     """Batch of trajectory data for GCDT training."""
     states: np.ndarray       # (batch, context_len, state_dim)
@@ -36,17 +45,23 @@ class D4RLDataset:
         max_goal_horizon: int = 50,
         waypoint_horizon: int = 10,
         task_type: str = "antmaze",  # "antmaze" or "kitchen"
+        normalize: bool = True,
+        norm_stats: Optional[NormalizationStats] = None,
+        her_relabel_prob: float = 0.8,  # HER: probability of relabeling to achieved goal
     ):
         """
         Args:
             dataset: D4RL dataset dict with 'observations', 'actions', 'terminals', etc.
             env: Gym environment for goal extraction
             context_len: Number of (state, action) pairs in context
-            goal_sampling: "future" (sample from same trajectory) or "random"
+            goal_sampling: "future" (sample from same trajectory) or "her" (hindsight relabeling)
             min_goal_horizon: Minimum steps ahead for goal
             max_goal_horizon: Maximum steps ahead for goal
             waypoint_horizon: Steps ahead for waypoint prediction target
             task_type: Type of D4RL task ("antmaze" or "kitchen")
+            normalize: Whether to normalize observations and goals
+            norm_stats: Pre-computed normalization stats (for val set)
+            her_relabel_prob: Probability of using achieved final state as goal (HER)
         """
         self.observations = dataset["observations"]
         self.actions = dataset["actions"]
@@ -57,6 +72,8 @@ class D4RLDataset:
         # AntMaze obs format: [qpos, qvel, goal_xy] where goal is last 2 dims
         self.task_type = task_type
         self.env = env
+        self.normalize = normalize
+        self.her_relabel_prob = her_relabel_prob
 
         if task_type == "antmaze":
             # Goals are the target xy position (last 2 dims of observation)
@@ -69,6 +86,17 @@ class D4RLDataset:
             self.achieved_goals = self.observations
         else:
             raise ValueError(f"Unknown task type: {task_type}")
+
+        # Compute or use provided normalization statistics
+        if normalize:
+            if norm_stats is not None:
+                self.norm_stats = norm_stats
+            else:
+                self.norm_stats = self._compute_norm_stats()
+            print(f"Normalization: obs_mean range [{self.norm_stats.obs_mean.min():.2f}, {self.norm_stats.obs_mean.max():.2f}], "
+                  f"goal_mean range [{self.norm_stats.goal_mean.min():.2f}, {self.norm_stats.goal_mean.max():.2f}]")
+        else:
+            self.norm_stats = None
 
         self.context_len = context_len
         self.goal_sampling = goal_sampling
@@ -134,6 +162,33 @@ class D4RLDataset:
             print(f"Trajectory length stats: min={self.trajectory_lengths.min()}, "
                   f"max={self.trajectory_lengths.max()}, mean={self.trajectory_lengths.mean():.1f}")
 
+    def _compute_norm_stats(self) -> NormalizationStats:
+        """Compute normalization statistics from dataset."""
+        obs_mean = self.observations.mean(axis=0)
+        obs_std = self.observations.std(axis=0) + 1e-6  # Avoid division by zero
+
+        goal_mean = self.achieved_goals.mean(axis=0)
+        goal_std = self.achieved_goals.std(axis=0) + 1e-6
+
+        return NormalizationStats(
+            obs_mean=obs_mean,
+            obs_std=obs_std,
+            goal_mean=goal_mean,
+            goal_std=goal_std,
+        )
+
+    def normalize_obs(self, obs: np.ndarray) -> np.ndarray:
+        """Normalize observations using stored statistics."""
+        if self.norm_stats is None:
+            return obs
+        return (obs - self.norm_stats.obs_mean) / self.norm_stats.obs_std
+
+    def normalize_goal(self, goal: np.ndarray) -> np.ndarray:
+        """Normalize goals using stored statistics."""
+        if self.norm_stats is None:
+            return goal
+        return (goal - self.norm_stats.goal_mean) / self.norm_stats.goal_std
+
     def sample_batch(self, batch_size: int, rng: np.random.Generator) -> TrajectoryBatch:
         """
         Sample a batch of trajectory contexts with goals.
@@ -186,22 +241,36 @@ class D4RLDataset:
             # Target action is the last action in context
             target_action = actions[-1]
 
-            # Sample goal from future in same trajectory
-            if self.goal_sampling == "future":
-                max_horizon = min(self.max_goal_horizon, traj_end - ctx_end)
-                if max_horizon > self.min_goal_horizon:
-                    goal_horizon = rng.integers(self.min_goal_horizon, max_horizon + 1)
-                else:
-                    goal_horizon = max(1, max_horizon)
-                goal_idx = min(ctx_end - 1 + goal_horizon, traj_end - 1)
-                goal = self.achieved_goals[goal_idx]
-            else:
-                # Random goal from dataset
-                goal_idx = rng.integers(0, len(self.achieved_goals))
-                goal = self.achieved_goals[goal_idx]
+            # Goal sampling with Hindsight Experience Replay (HER)
+            # Key insight: 80% of time, use trajectory's FINAL achieved state as goal
+            # This teaches "how to reach where I actually ended up" - enables stitching
+            use_her = rng.random() < self.her_relabel_prob
 
-            # Future state for waypoint loss
-            waypoint_idx = min(ctx_end - 1 + self.waypoint_horizon, traj_end - 1)
+            if use_her:
+                # HER: Use the final achieved state of this trajectory as goal
+                # This is the key to learning from "failed" trajectories
+                final_state_idx = traj_end - 1
+                goal = self.achieved_goals[final_state_idx]
+                # Waypoint should also be relative to where we're heading
+                # Use a state between current position and trajectory end
+                waypoint_idx = min(ctx_end - 1 + self.waypoint_horizon, traj_end - 1)
+            else:
+                # Original behavior: sample future state as goal
+                if self.goal_sampling == "future":
+                    max_horizon = min(self.max_goal_horizon, traj_end - ctx_end)
+                    if max_horizon > self.min_goal_horizon:
+                        goal_horizon = rng.integers(self.min_goal_horizon, max_horizon + 1)
+                    else:
+                        goal_horizon = max(1, max_horizon)
+                    goal_idx = min(ctx_end - 1 + goal_horizon, traj_end - 1)
+                    goal = self.achieved_goals[goal_idx]
+                else:
+                    # Random goal from dataset (for diversity)
+                    goal_idx = rng.integers(0, len(self.achieved_goals))
+                    goal = self.achieved_goals[goal_idx]
+                waypoint_idx = min(ctx_end - 1 + self.waypoint_horizon, traj_end - 1)
+
+            # Future state for waypoint loss (goal-relative planning)
             future_state = self.observations[waypoint_idx]
 
             states_batch.append(states)
@@ -211,13 +280,26 @@ class D4RLDataset:
             target_actions_batch.append(target_action)
             future_states_batch.append(future_state)
 
+        # Stack and apply normalization
+        states_arr = np.stack(states_batch)
+        goals_arr = np.stack(goals_batch)
+        future_states_arr = np.stack(future_states_batch)
+
+        if self.normalize and self.norm_stats is not None:
+            # Normalize states: (batch, seq, dim) -> apply per-dim normalization
+            states_arr = (states_arr - self.norm_stats.obs_mean) / self.norm_stats.obs_std
+            # Normalize goals: (batch, goal_dim)
+            goals_arr = (goals_arr - self.norm_stats.goal_mean) / self.norm_stats.goal_std
+            # Normalize future states for waypoint loss
+            future_states_arr = (future_states_arr - self.norm_stats.obs_mean) / self.norm_stats.obs_std
+
         return TrajectoryBatch(
-            states=np.stack(states_batch),
+            states=states_arr,
             actions=np.stack(actions_batch),
-            goals=np.stack(goals_batch),
+            goals=goals_arr,
             timesteps=np.stack(timesteps_batch),
             target_actions=np.stack(target_actions_batch),
-            future_states=np.stack(future_states_batch),
+            future_states=future_states_arr,
         )
 
     def __len__(self) -> int:
@@ -323,19 +405,24 @@ def load_d4rl_dataset(
     print(f"Dataset: {dataset_name}")
     print(f"Total samples: {n_samples}, Train: {len(train_data['observations'])}, Val: {len(val_data['observations'])}")
 
+    # Create train dataset (computes normalization stats)
     train_dataset = D4RLDataset(
         dataset=train_data,
         env=env,
         context_len=context_len,
         task_type=task_type,
+        normalize=True,
         **kwargs
     )
 
+    # Create val dataset using same normalization stats as train
     val_dataset = D4RLDataset(
         dataset=val_data,
         env=env,
         context_len=context_len,
         task_type=task_type,
+        normalize=True,
+        norm_stats=train_dataset.norm_stats,  # Use train stats!
         **kwargs
     )
 
@@ -351,6 +438,7 @@ def load_d4rl_dataset(
         "goal_dim": goal_dim,
         "env": env,
         "task_type": task_type,
+        "norm_stats": train_dataset.norm_stats,  # Include for eval
     }
 
     return train_dataset, val_dataset, env_info
