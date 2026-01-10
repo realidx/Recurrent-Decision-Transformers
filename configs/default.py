@@ -73,7 +73,7 @@ class TrainingConfig:
     batch_size: int = 256
     
     # Context window for trajectory sampling
-    context_len: int = 64  # Number of (s, a) pairs in context
+    context_len: int = 20  # Number of (s, a) pairs in context
     
     # Evaluation
     eval_every: int = 10000
@@ -111,7 +111,7 @@ class DataConfig:
 
     # Future goal horizon range (for "future" sampling)
     min_goal_horizon: int = 1
-    max_goal_horizon: int = 200  # Must cover full maze trajectories (200-500 steps)
+    max_goal_horizon: int = 50
 
     # Hindsight Experience Replay (HER) relabeling probability
     # 80% of time: use trajectory's FINAL achieved state as goal (enables stitching)
