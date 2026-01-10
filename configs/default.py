@@ -58,7 +58,7 @@ class AuxiliaryConfig:
 class TrainingConfig:
     """Training configuration."""
     # Optimization
-    learning_rate: float = 1e-4
+    learning_rate: float = 0.0001
     weight_decay: float = 0.1
     warmup_steps: int = 1000
     max_steps: int = 100000
@@ -70,12 +70,12 @@ class TrainingConfig:
     context_len: int = 20  # Number of (s, a) pairs in context
     
     # Evaluation
-    eval_every: int = 5000
-    eval_episodes: int = 100
+    eval_every: int = 10000
+    eval_episodes: int = 50
     
     # Logging
-    log_every: int = 100
-    save_every: int = 10000
+    log_every: int = 1000
+    save_every: int = 50000
     
     # Reproducibility
     seed: int = 42
@@ -117,7 +117,7 @@ class DataConfig:
 class EvalConfig:
     """Evaluation configuration for test-time scaling experiments."""
     # Test with different numbers of UT iterations (V3: K=12 training)
-    test_iterations: List[int] = field(default_factory=lambda: [6, 12, 18, 24])
+    test_iterations: List[int] = field(default_factory=lambda: [12, 24])
 
     # Evaluate on different goal distance buckets
     goal_distance_buckets: List[int] = field(default_factory=lambda: [10, 25, 50, 100])

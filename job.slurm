@@ -7,7 +7,7 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=32G
-#SBATCH --gres=gpu:4
+#SBATCH --gres=gpu:2
 
 set -euo pipefail
 
@@ -43,15 +43,15 @@ export OUTPUT_DIR="$(realpath -m "$OUTPUT_DIR")"
 
 mkdir -p "$OUTPUT_DIR"
 
-export SEEDS="${SEEDS:-42 123 456}"
+export SEEDS="${SEEDS:-42}"
 export SKIP_BASELINE="${SKIP_BASELINE:-1}"
 export LOG_EVERY="${LOG_EVERY:-1000}"
 export EVAL_EVERY="${EVAL_EVERY:-10000}"
-export SAVE_EVERY="${SAVE_EVERY:-10000}"
+export SAVE_EVERY="${SAVE_EVERY:-50000}"
 
 # FAST_MODE: Set to 1 for quick iteration (~1h/model instead of ~4h)
 # Uses: 25k steps (vs 100k), 20 eval episodes (vs 100), single seed
-export FAST_MODE="${FAST_MODE:-1}"
+export FAST_MODE="${FAST_MODE:-0}"
 
 # Additional overrides for fine-grained control
 export MAX_STEPS="${MAX_STEPS:-}"

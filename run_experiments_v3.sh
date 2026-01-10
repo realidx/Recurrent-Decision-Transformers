@@ -14,7 +14,7 @@ set -e
 
 TASK="${TASK:-antmaze-umaze-v2}"
 OUTPUT_DIR="${OUTPUT_DIR:-./outputs}"
-SEEDS="${SEEDS:-42 123 456}"
+SEEDS="${SEEDS:-42}"
 SKIP_BASELINE="${SKIP_BASELINE:-1}"
 
 # V3 Architecture: L=12 layers, K=12 iterations
@@ -23,7 +23,7 @@ SKIP_BASELINE="${SKIP_BASELINE:-1}"
 # ============================================
 # FAST_MODE: For quick iteration and debugging
 # ============================================
-FAST_MODE="${FAST_MODE:-1}"
+FAST_MODE="${FAST_MODE:-0}"
 
 if [ "$FAST_MODE" -eq 1 ]; then
     echo ">>> FAST_MODE enabled - reduced settings for quick iteration <<<"
@@ -88,19 +88,6 @@ fi
 # - Shared action head applied at every step k
 # - Loss: Sum of MSE from shared head at each step
 
-echo ""
-echo "[Phase 2] Training U-GCDT with Gated Recurrence (K=12)"
-echo "Gated update: H_{k+1} = (1-g) * H_k + g * Block(H_k)"
-echo ""
-
-for seed in $SEEDS; do
-    echo "  Seed: $seed"
-    python scripts/train.py \
-        --config ut_gcdt_gated \
-        --dataset "$TASK" \
-        --seed "$seed" \
-        --output_dir "$OUTPUT_DIR"
-done
 
 # ============================================
 # Phase 2b (Optional): U-GCDT Full (with waypoint loss)
