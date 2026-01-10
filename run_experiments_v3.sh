@@ -105,6 +105,29 @@ for seed in $SEEDS; do
         --output_dir "$OUTPUT_DIR"
 done
 
+
+# ============================================
+# Phase 2c: Multi-Block U-GCDT (2 blocks x 6 cycles = 12)
+# ============================================
+# Architecture: 2 unique Transformer Blocks cycled 6 times
+# - Hybrid between full tying (1 block) and no tying (12 blocks)
+# - Block 0 and Block 1 have independent weights
+# - Pattern: B0, B1, B0, B1, B0, B1, B0, B1, B0, B1, B0, B1
+# - Total: 12 block applications (2 x 6)
+
+echo ""
+echo "[Phase 2c] Training Multi-Block U-GCDT (2 blocks x 6 cycles)"
+echo ""
+
+for seed in $SEEDS; do
+    echo "  Seed: $seed"
+    python scripts/train.py \
+        --config ut_gcdt_multiblock \
+        --dataset "$TASK" \
+        --seed "$seed" \
+        --output_dir "$OUTPUT_DIR"
+done
+
 echo ""
 echo "========================================"
 echo "Training complete!"
