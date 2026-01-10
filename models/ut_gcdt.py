@@ -200,7 +200,7 @@ class UTGCDT(nn.Module):
 
             # Deep supervision: predict action at each step k using SHARED head
             # This enables summed loss across all iterations (like independent heads for baseline)
-            if return_intermediates or k == K - 1:
+            if return_intermediates or k < K - 1:
                 # Apply layer norm before action prediction
                 step_hidden = self.final_ln(hidden)
                 last_state_hidden = step_hidden[:, last_state_idx, :]
@@ -218,6 +218,9 @@ class UTGCDT(nn.Module):
         
         # Final layer norm (already applied in loop for action predictions)
         hidden = self.final_ln(hidden)
+        last_state_hidden = hidden[:, last_state_idx, :]
+        action_pred = self.action_head(last_state_hidden)
+        intermediate_action_preds.append(action_pred)
 
         # Final action prediction is the last intermediate prediction
         action_pred = intermediate_action_preds[-1]
@@ -324,7 +327,7 @@ class GCDT(nn.Module):
             attn_mask = jnp.tril(jnp.ones((total_seq_len, total_seq_len)))
             attn_mask = attn_mask.at[0, :].set(1)
             if self.plan_token_block_last_action:
-                last_action_idx = plan_offset + 2 * seq_len
+                last_action_idx = plan_offset + 1 + 2 * seq_len - 1
                 attn_mask = attn_mask.at[0, last_action_idx].set(0)
             attn_mask = attn_mask[None, None, :, :]
 
