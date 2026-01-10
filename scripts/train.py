@@ -652,7 +652,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, default="ut_gcdt_full",
                        choices=["gcdt_baseline", "ut_gcdt", "ut_gcdt_plan", "ut_gcdt_full",
-                                "ut_gcdt_gated", "ut_gcdt_gated_full"])
+                                "ut_gcdt_gated", "ut_gcdt_gated_full", "ut_gcdt_multiblock"])
     parser.add_argument("--dataset", type=str, default="antmaze-medium-stitch-v0")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output_dir", type=str, default="./outputs")
@@ -670,6 +670,7 @@ if __name__ == "__main__":
         get_ut_gcdt_full_config,
         get_ut_gcdt_gated_config,
         get_ut_gcdt_gated_full_config,
+        get_ut_gcdt_multiblock_config,
     )
 
     config_map = {
@@ -679,6 +680,7 @@ if __name__ == "__main__":
         "ut_gcdt_full": get_ut_gcdt_full_config,
         "ut_gcdt_gated": get_ut_gcdt_gated_config,
         "ut_gcdt_gated_full": get_ut_gcdt_gated_full_config,
+        "ut_gcdt_multiblock": get_ut_gcdt_multiblock_config,
     }
     
     config = config_map[args.config]()

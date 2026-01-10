@@ -22,7 +22,13 @@ class ModelConfig:
     # For UT-GCDT (tied) - V3 Protocol: K=12 iterations
     num_iterations: int = 12  # K in the paper
     use_weight_tying: bool = True
-    
+
+    # For Multi-Block UT-GCDT: multiple unique blocks cycled repeatedly
+    # Total updates = num_blocks * num_cycles
+    # E.g., num_blocks=2, num_cycles=6 -> 12 total updates
+    num_blocks: int = 1  # Number of unique transformer blocks
+    num_cycles: int = 1  # Number of times to cycle through all blocks
+
     # Step embeddings for UT iterations
     use_step_embeddings: bool = True
     step_embedding_type: str = "learned"  # "learned" or "sinusoidal"
@@ -256,6 +262,39 @@ def get_ut_gcdt_gated_full_config() -> Config:
     config.model.use_step_embeddings = True
     config.model.step_embedding_type = "sinusoidal"
     config.model.use_gated_loop = True
+    config.aux.use_waypoint_loss = True
+    config.aux.deep_supervision = True
+    return config
+
+
+def get_ut_gcdt_multiblock_config() -> Config:
+    """
+    Multi-Block U-GCDT: 2 unique blocks cycled 6 times (12 total updates).
+
+    This is a hybrid between:
+    - Full weight tying (1 block, K iterations) - maximum parameter efficiency
+    - No weight tying (L independent layers) - maximum expressivity
+
+    Key idea: Use 2 unique transformer blocks and cycle through them 6 times.
+    This allows:
+    - More expressivity than single-block UT (different weights per block)
+    - Better parameter efficiency than 12 independent layers
+    - Potential for learned block specialization (e.g., refinement vs prediction)
+
+    Config: 2 blocks x 6 cycles = 12 total updates
+    - Plan token for iterative refinement
+    - Sinusoidal step embeddings (no param leak)
+    - Waypoint auxiliary loss with deep supervision
+    """
+    config = Config(exp_name="ut_gcdt_multiblock_2x6")
+    config.model.use_weight_tying = True  # Indicates UT-style (not GCDT baseline)
+    config.model.num_blocks = 2  # 2 unique transformer blocks
+    config.model.num_cycles = 6  # Cycle through blocks 6 times
+    config.model.num_iterations = 12  # Total: 2 * 6 = 12 (for compatibility)
+    config.model.use_plan_token = True
+    config.model.use_step_embeddings = True
+    config.model.step_embedding_type = "sinusoidal"
+    config.model.use_gated_loop = False
     config.aux.use_waypoint_loss = True
     config.aux.deep_supervision = True
     return config

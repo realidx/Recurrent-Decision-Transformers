@@ -105,6 +105,28 @@ for seed in $SEEDS; do
         --output_dir "$OUTPUT_DIR"
 done
 
+# ============================================
+# Phase 2c: Multi-Block U-GCDT (2 blocks x 6 cycles = 12)
+# ============================================
+# Architecture: 2 unique Transformer Blocks cycled 6 times
+# - Hybrid between full tying (1 block) and no tying (12 blocks)
+# - Block 0 and Block 1 have independent weights
+# - Pattern: B0, B1, B0, B1, B0, B1, B0, B1, B0, B1, B0, B1
+# - Total: 12 block applications (2 x 6)
+
+echo ""
+echo "[Phase 2c] Training Multi-Block U-GCDT (2 blocks x 6 cycles)"
+echo ""
+
+for seed in $SEEDS; do
+    echo "  Seed: $seed"
+    python scripts/train.py \
+        --config ut_gcdt_multiblock \
+        --dataset "$TASK" \
+        --seed "$seed" \
+        --output_dir "$OUTPUT_DIR"
+done
+
 echo ""
 echo "========================================"
 echo "Training complete!"
@@ -119,12 +141,14 @@ echo "========================================"
 echo "EVALUATION (run after training)"
 echo "========================================"
 echo ""
-echo "1. Compare baseline vs U-GCDT:"
+echo "1. Compare baseline vs U-GCDT variants:"
 echo "   python scripts/eval.py --checkpoint $OUTPUT_DIR/gcdt_baseline_*/best_* --test_iterations 12"
 echo "   python scripts/eval.py --checkpoint $OUTPUT_DIR/ut_gcdt_gated_*/best_* --test_iterations 12"
+echo "   python scripts/eval.py --checkpoint $OUTPUT_DIR/ut_gcdt_multiblock_*/best_* --test_iterations 12"
 echo ""
 echo "2. Test-time scaling (U-GCDT only):"
 echo "   python scripts/eval.py --checkpoint $OUTPUT_DIR/ut_gcdt_gated_*/best_* --test_iterations 6 12 18 24"
+echo "   python scripts/eval.py --checkpoint $OUTPUT_DIR/ut_gcdt_multiblock_*/best_* --num_cycles 3 6 9 12"
 echo ""
 echo "========================================"
 
