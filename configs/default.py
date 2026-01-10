@@ -294,7 +294,7 @@ def get_ut_gcdt_multiblock_config() -> Config:
     config.model.use_plan_token = True
     config.model.use_step_embeddings = True
     config.model.step_embedding_type = "sinusoidal"
-    config.model.use_gated_loop = False
+    config.model.use_gated_loop = True  # Enable gating for better gradient flow
     config.aux.use_waypoint_loss = True
     config.aux.deep_supervision = True
     return config
