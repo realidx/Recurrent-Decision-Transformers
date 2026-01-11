@@ -1,4 +1,4 @@
-"""Training script for UT-GCDT on D4RL/OGBench."""
+"""Training script for UT-GCDT on D4RL/OGBench with resume support."""
 
 import os
 import sys
@@ -7,7 +7,7 @@ import json
 import dataclasses
 from datetime import datetime
 from functools import partial
-from typing import Dict, Any, Tuple
+from typing import Dict, Any, Tuple, Optional
 
 import jax
 import jax.numpy as jnp
@@ -110,6 +110,59 @@ def create_train_state(
     )
 
 
+def load_checkpoint(
+    checkpoint_dir: str,
+    state: TrainState,
+    prefix: str = "checkpoint_",
+) -> Tuple[TrainState, int]:
+    """
+    Load the latest checkpoint from directory.
+    
+    Args:
+        checkpoint_dir: Directory containing checkpoints
+        state: Initial TrainState (for structure)
+        prefix: Checkpoint file prefix
+        
+    Returns:
+        Restored TrainState and step number
+    """
+    restored_state = checkpoints.restore_checkpoint(
+        checkpoint_dir,
+        target=state,
+        prefix=prefix,
+    )
+    
+    # Get step from restored state
+    step = int(restored_state.step)
+    
+    return restored_state, step
+
+
+def find_latest_checkpoint(checkpoint_dir: str) -> Optional[str]:
+    """Find the latest checkpoint in a directory."""
+    if not os.path.exists(checkpoint_dir):
+        return None
+    
+    # Look for checkpoint files
+    checkpoint_files = [f for f in os.listdir(checkpoint_dir) if f.startswith("checkpoint_")]
+    if not checkpoint_files:
+        return None
+    
+    # Extract step numbers and find max
+    steps = []
+    for f in checkpoint_files:
+        try:
+            step = int(f.split("_")[1])
+            steps.append(step)
+        except (IndexError, ValueError):
+            continue
+    
+    if not steps:
+        return None
+    
+    return checkpoint_dir
+
+
 def compute_loss(
     params: Dict,
     apply_fn,
@@ -138,9 +191,6 @@ def compute_loss(
         metrics: Dictionary of individual loss components
     """
     # Forward pass
-    # return_intermediates=True enables deep supervision for both:
-    # - UTGCDT: waypoint predictions at each iteration
-    # - GCDT: action predictions from each layer's independent head
     outputs = apply_fn(
         params,
         states=batch["states"],
@@ -159,19 +209,18 @@ def compute_loss(
 
     metrics = {"action_loss": action_loss}
 
-    # V3 Protocol: Sum of MSE losses from ALL heads/steps (not weighted)
-    # For GCDT: independent heads at each layer L
-    # For U-GCDT: shared head applied at each step K
-    # Loss = sum_{l=1}^{L} MSE(Head_l(x_l), a_true)
+    # Deep supervision: Sum of MSE losses from ALL heads/steps
     if "intermediate_action_preds" in outputs and aux_deep_supervision:
         intermediate_preds = outputs["intermediate_action_preds"]
         if len(intermediate_preds) >= 1:
-            # Sum MSE loss from ALL heads/steps (V3 protocol: no weighting)
+            # Progressive weighting: later iterations weighted more
             total_loss = 0.0
-            for pred in intermediate_preds:
-                total_loss += jnp.mean((pred - target_actions) ** 2)
+            num_preds = len(intermediate_preds)
+            for k, pred in enumerate(intermediate_preds):
+                step_weight = (k + 1) / num_preds
+                total_loss += step_weight * jnp.mean((pred - target_actions) ** 2)
             metrics["deep_action_loss"] = total_loss
-            # Note: action_loss (final head) is already included in intermediate_preds
+            metrics["action_loss"] = jnp.mean((intermediate_preds[-1] - target_actions) ** 2)
         else:
             total_loss = action_loss
     else:
@@ -183,13 +232,11 @@ def compute_loss(
         future_states = batch["future_states"]
         
         if aux_deep_supervision:
-            # Apply loss at each iteration
             waypoint_loss = 0.0
             for wp_pred in waypoint_preds:
                 waypoint_loss += jnp.mean((wp_pred - future_states) ** 2)
             waypoint_loss /= len(waypoint_preds)
         else:
-            # Only final iteration
             waypoint_loss = jnp.mean((waypoint_preds[-1] - future_states) ** 2)
         
         waypoint_loss = waypoint_loss_weight * waypoint_loss
@@ -277,7 +324,6 @@ def create_train_step_pmap(aux_use_waypoint_loss, aux_deep_supervision, waypoint
 def shard_batch(batch: Dict[str, jnp.ndarray], num_devices: int) -> Dict[str, jnp.ndarray]:
     """Shard batch across devices. Shape: (batch,) -> (devices, batch//devices, ...)"""
     def _shard(x):
-        # Reshape to (num_devices, batch_per_device, ...)
         batch_size = x.shape[0]
         batch_per_device = batch_size // num_devices
         return x[:num_devices * batch_per_device].reshape((num_devices, batch_per_device) + x.shape[1:])
@@ -310,110 +356,164 @@ def evaluate_policy(
     state: TrainState,
     env,
     config: Config,
+    norm_stats,
+    task_type: str = "antmaze",
     num_episodes: int = 10,
-    max_steps: int = 1000,
+    max_steps: int = 600,
 ) -> Dict[str, float]:
-    """
-    Evaluate policy in environment.
+    """Evaluate the current policy in the environment."""
     
-    Returns:
-        Dictionary with success_rate, avg_steps, etc.
-    """
+    @jax.jit
+    def get_action(params, states, actions, goals, timesteps):
+        outputs = state.apply_fn(params, states=states, actions=actions, 
+                                goals=goals, timesteps=timesteps, deterministic=True)
+        return outputs["action_pred"]
+
     successes = []
     steps_list = []
     
-    for task_id in range(1, 6):  # OGBench has 5 evaluation tasks
-        task_successes = 0
-        task_steps = []
+    ctx_len = config.training.context_len
+    action_dim = env.action_space.shape[0]
+    
+    # Extract normalization stats
+    obs_mean = norm_stats.obs_mean
+    obs_std = norm_stats.obs_std
+    goal_mean = norm_stats.goal_mean
+    goal_std = norm_stats.goal_std
+    
+    for ep in range(num_episodes):
+        # Reset environment
+        reset_result = env.reset()
+        if isinstance(reset_result, tuple):
+            obs, info = reset_result
+        else:
+            obs = reset_result
+            info = {}
         
-        for _ in range(num_episodes // 5):
-            obs, info = env.reset(options={"task_id": task_id})
-            goal = info["goal"]
+        # Get goal based on task type
+        if task_type == "antmaze":
+            if hasattr(env, 'target_goal'):
+                goal_raw = np.array(env.target_goal)
+            elif hasattr(env.unwrapped, 'target_goal'):
+                goal_raw = np.array(env.unwrapped.target_goal)
+            else:
+                goal_raw = obs[:2]
+        else:
+            goal_raw = info.get("goal", obs.copy())
+        
+        # Normalize goal and observation
+        goal_normalized = (goal_raw - goal_mean) / goal_std
+        obs_normalized = (obs - obs_mean) / obs_std
+        
+        # Debug first episode
+        if ep == 0:
+            print(f"Target Goal:  ({goal_raw[0]}, {goal_raw[1]})")
+
+        # Context buffers
+        states_buffer = [obs_normalized]
+        actions_buffer = []
+        
+        done = False
+        steps = 0
+        success = False
+        
+        while not done and steps < max_steps:
+            # Prepare context
+            states_arr = np.array(states_buffer)
             
-            # Initialize context buffers
-            states_buffer = [obs]
-            actions_buffer = []
-            done = False
-            steps = 0
+            if len(states_buffer) < ctx_len:
+                pad_len = ctx_len - len(states_buffer)
+                state_pad = np.repeat(states_arr[0:1], pad_len, axis=0)
+                states = np.concatenate([state_pad, states_arr], axis=0)
+            else:
+                states = states_arr[-ctx_len:]
             
-            while not done and steps < max_steps:
-                # Prepare input for model
-                # Pad context if needed
-                ctx_len = config.training.context_len
-                action_dim = env.action_space.shape[0]
-
-                states_arr = np.array(states_buffer)
-                if actions_buffer:
-                    actions_arr = np.array(actions_buffer)
-                    actions_seq = np.concatenate([actions_arr, np.zeros((1, action_dim))], axis=0)
-                    pad_action = np.array(actions_buffer[0])
+            # Prepare actions with last zeroed
+            if len(actions_buffer) == 0:
+                actions = np.zeros((ctx_len, action_dim))
+            else:
+                actions_arr = np.array(actions_buffer)
+                if len(actions_buffer) < ctx_len - 1:
+                    pad_len = ctx_len - len(actions_buffer) - 1
+                    actions = np.concatenate([
+                        np.zeros((pad_len, action_dim)),
+                        actions_arr,
+                        np.zeros((1, action_dim))
+                    ], axis=0)
                 else:
-                    actions_seq = np.zeros((1, action_dim))
-                    pad_action = np.zeros(action_dim)
+                    actions = np.concatenate([
+                        actions_arr[-(ctx_len-1):],
+                        np.zeros((1, action_dim))
+                    ], axis=0)
+            
+            # Model forward pass
+            states_input = jnp.array(states[None])
+            actions_input = jnp.array(actions[None])
+            goals_input = jnp.array(goal_normalized[None])
+            timesteps_input = jnp.arange(ctx_len)[None]
+            
+            action = np.array(get_action(state.params, states_input, actions_input, 
+                             goals_input, timesteps_input)[0])
+            
+            # Action smoothing
+            if len(actions_buffer) > 0:
+                prev_action = actions_buffer[-1]
+                action = 0.7 * action + 0.3 * prev_action
 
-                if len(states_buffer) < ctx_len:
-                    # Pad with first observation/action
-                    pad_len = ctx_len - len(states_buffer)
-                    state_pad = np.repeat(states_arr[0:1], pad_len, axis=0)
-                    states = np.concatenate([state_pad, states_arr], axis=0)
-
-                    action_pad = np.repeat(pad_action[None, :], pad_len, axis=0)
-                    actions = np.concatenate([action_pad, actions_seq], axis=0)
-                else:
-                    states = states_arr[-ctx_len:]
-                    actions = actions_seq[-ctx_len:]
-                
-                # Add batch dimension
-                states_input = jnp.array(states[None])
-                actions_input = jnp.array(actions[None])
-                goals_input = jnp.array(goal[None])
-                timesteps_input = jnp.arange(ctx_len)[None]
-                
-                # Get action prediction
-                outputs = state.apply_fn(
-                    state.params,
-                    states=states_input,
-                    actions=actions_input,
-                    goals=goals_input,
-                    timesteps=timesteps_input,
-                    deterministic=True,
-                )
-                action = np.array(outputs["action_pred"][0])
-                
-                # Clip action to valid range
-                action = np.clip(action, env.action_space.low, env.action_space.high)
-                
-                # Step environment
-                obs, reward, terminated, truncated, info = env.step(action)
+            action = np.clip(action, env.action_space.low, env.action_space.high)
+            
+            # Step environment
+            step_result = env.step(action)
+            if len(step_result) == 5:
+                obs, reward, terminated, truncated, info = step_result
                 done = terminated or truncated
-                
-                # Update buffers
-                states_buffer.append(obs)
-                actions_buffer.append(action)
-                steps += 1
-                
-                if info.get("success", False):
-                    task_successes += 1
-                    task_steps.append(steps)
-                    break
+            else:
+                obs, reward, done, info = step_result
+                dist_to_goal = np.linalg.norm(obs[:2] - goal_raw)
+                if done:
+                    print(f"Episode {ep} ended at step {steps} with dist_to_goal={dist_to_goal}")
             
-            if not info.get("success", False):
-                task_steps.append(max_steps)
+            if ep == 0 and steps % 50 == 0:
+                print(f"Step {steps}: pos={obs[:2]}, dist_to_goal={dist_to_goal}")
+
+            # Normalize new observation
+            obs_normalized = (obs - obs_mean) / obs_std
+            
+            # Update buffers
+            states_buffer.append(obs_normalized)
+            actions_buffer.append(action)
+            steps += 1
+            
+            # Check success by distance (threshold = 0.5 for antmaze)
+            
+            if dist_to_goal < 0.5:
+                success = True
+                break
+
+            # Also check info
+            if info.get("success", False):
+                success = True
+                break
         
-        successes.append(task_successes / (num_episodes // 5))
-        steps_list.extend(task_steps)
+        successes.append(float(success))
+        steps_list.append(steps)
     
     return {
         "success_rate": np.mean(successes),
         "avg_steps": np.mean(steps_list),
-        "success_per_task": successes,
     }
 
 
-def train(config: Config):
-    """Main training loop with multi-GPU support."""
+def train(config: Config, resume_from: Optional[str] = None):
+    """
+    Main training loop with multi-GPU support and resume capability.
+    
+    Args:
+        config: Training configuration
+        resume_from: Path to checkpoint directory to resume from (optional)
+    """
 
-    # Allow environment overrides for fast iteration on clusters
+    # Allow environment overrides
     max_steps = os.environ.get("MAX_STEPS")
     if max_steps:
         config.training.max_steps = int(max_steps)
@@ -438,31 +538,39 @@ def train(config: Config):
     use_multi_gpu = NUM_DEVICES > 1
     if use_multi_gpu:
         print(f"\n=== Multi-GPU Training Enabled ({NUM_DEVICES} devices) ===")
-        # Ensure batch size is divisible by number of devices
         if config.training.batch_size % NUM_DEVICES != 0:
             old_batch_size = config.training.batch_size
             config.training.batch_size = (config.training.batch_size // NUM_DEVICES) * NUM_DEVICES
-            print(f"Adjusted batch_size: {old_batch_size} -> {config.training.batch_size} (divisible by {NUM_DEVICES})")
+            print(f"Adjusted batch_size: {old_batch_size} -> {config.training.batch_size}")
     
-    # Create output directory
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_dir = os.path.join(config.output_dir, f"{config.exp_name}_{timestamp}")
-    os.makedirs(output_dir, exist_ok=True)
-    
-    # Save config
-    def config_to_dict(value):
-        """Recursively convert dataclasses to dicts for JSON serialization."""
-        if dataclasses.is_dataclass(value):
-            return {k: config_to_dict(v) for k, v in dataclasses.asdict(value).items()}
-        return value
+    # Handle output directory for resume vs new training
+    if resume_from:
+        output_dir = resume_from
+        print(f"\n=== Resuming training from {resume_from} ===")
+        
+        # Load config from checkpoint directory if exists
+        config_path = os.path.join(resume_from, "config.json")
+        if os.path.exists(config_path):
+            print(f"Loading config from {config_path}")
+            # Note: You might want to merge with current config for some overrides
+    else:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_dir = os.path.join(config.output_dir, f"{config.exp_name}_{timestamp}")
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # Save config
+        def config_to_dict(value):
+            if dataclasses.is_dataclass(value):
+                return {k: config_to_dict(v) for k, v in dataclasses.asdict(value).items()}
+            return value
 
-    with open(os.path.join(output_dir, "config.json"), "w") as f:
-        json.dump(config_to_dict(config), f, indent=2)
+        with open(os.path.join(output_dir, "config.json"), "w") as f:
+            json.dump(config_to_dict(config), f, indent=2)
     
     print(f"Output directory: {output_dir}")
     print(f"Loading dataset: {config.data.dataset_name} (type: {config.data.dataset_type})")
 
-    # Load dataset based on type
+    # Load dataset
     if config.data.dataset_type == "d4rl":
         train_dataset, val_dataset, env_info = load_d4rl_dataset(
             dataset_name=config.data.dataset_name,
@@ -471,7 +579,7 @@ def train(config: Config):
             min_goal_horizon=config.data.min_goal_horizon,
             max_goal_horizon=config.data.max_goal_horizon,
             waypoint_horizon=config.aux.waypoint_horizon,
-            her_relabel_prob=config.data.her_relabel_prob,  # HER for stitching
+            her_relabel_prob=config.data.her_relabel_prob,
         )
         DataLoader = D4RLDataLoader
         batch_to_jax = d4rl_batch_to_jax
@@ -492,13 +600,14 @@ def train(config: Config):
     # Update config with environment info
     config.state_dim = env_info["state_dim"]
     config.action_dim = env_info["action_dim"]
-    # For D4RL antmaze, goal_dim may differ from state_dim
     config.goal_dim = env_info.get("goal_dim", env_info["state_dim"])
 
     print(f"State dim: {config.state_dim}, Action dim: {config.action_dim}, Goal dim: {config.goal_dim}")
+    print(f"norm_stats in env_info: {'norm_stats' in env_info}")
+    print(f"norm_stats.goal_mean shape: {env_info['norm_stats'].goal_mean.shape}")
 
-    # Save normalization stats for eval
-    if "norm_stats" in env_info and env_info["norm_stats"] is not None:
+    # Save normalization stats (only for new training)
+    if not resume_from and "norm_stats" in env_info and env_info["norm_stats"] is not None:
         norm_stats = env_info["norm_stats"]
         np.savez(
             os.path.join(output_dir, "norm_stats.npz"),
@@ -523,8 +632,13 @@ def train(config: Config):
         seed=config.training.seed + 1,
         infinite=True,
     )
+
+    # Verify data loader
+    b = train_loader.get_batch()
+    print(f"Last action: {b.actions[0, -1, :]}") 
+    print(f"Target: {b.target_actions[0, :]}")
     
-    # Create model
+    # Create model and initial state
     rng, init_rng = jax.random.split(rng)
     model = create_model(config)
     state = create_train_state(
@@ -536,7 +650,42 @@ def train(config: Config):
         config.goal_dim,
     )
 
-    # Multi-GPU: replicate state and create pmap'd train step
+    # Resume from checkpoint if specified
+    start_step = 0
+    best_success_rate = 0.0
+    
+    if resume_from:
+        print(f"\nLooking for checkpoints in {resume_from}...")
+        
+        # Try to load the latest checkpoint
+        try:
+            state, start_step = load_checkpoint(resume_from, state, prefix="checkpoint_")
+            print(f"✓ Restored checkpoint at step {start_step}")
+        except Exception as e:
+            print(f"Could not load regular checkpoint: {e}")
+            # Try loading best checkpoint
+            try:
+                state, start_step = load_checkpoint(resume_from, state, prefix="best_")
+                print(f"✓ Restored best checkpoint at step {start_step}")
+            except Exception as e2:
+                print(f"Could not load best checkpoint either: {e2}")
+                print("Starting from scratch...")
+                start_step = 0
+        
+        # Load best success rate from training state file if exists
+        training_state_path = os.path.join(resume_from, "training_state.json")
+        if os.path.exists(training_state_path):
+            with open(training_state_path, "r") as f:
+                training_state = json.load(f)
+                best_success_rate = training_state.get("best_success_rate", 0.0)
+                print(f"✓ Restored best_success_rate: {best_success_rate:.3f}")
+        
+        # Advance RNG to match resumed step
+        for _ in range(start_step):
+            rng, _ = jax.random.split(rng)
+        print(f"Advanced RNG state to step {start_step}")
+
+    # Multi-GPU: replicate state
     if use_multi_gpu:
         state = replicate(state)
         train_step_fn = create_train_step_pmap(
@@ -546,31 +695,35 @@ def train(config: Config):
         )
         print(f"State replicated across {NUM_DEVICES} devices")
     else:
-        train_step_fn = None  # Use train_step_single
+        train_step_fn = None
 
     # Training loop
-    print(f"\nStarting training for {config.training.max_steps} steps...")
+    print(f"\nStarting training from step {start_step} to {config.training.max_steps}...")
     
     train_iter = iter(train_loader)
-    best_success_rate = 0.0
     aux_use_waypoint_loss = config.aux.use_waypoint_loss
     aux_deep_supervision = config.aux.deep_supervision
     waypoint_loss_weight = config.aux.waypoint_loss_weight
     
-    for step in range(config.training.max_steps):
+    # Skip batches if resuming (to maintain data consistency)
+    if start_step > 0:
+        print(f"Skipping {start_step} batches to sync data iterator...")
+        for _ in range(start_step):
+            next(train_iter)
+        print("Data iterator synced.")
+    
+    for step in range(start_step, config.training.max_steps):
         rng, step_rng = jax.random.split(rng)
 
         # Get batch
         batch = next(train_iter)
         batch = batch_to_jax(batch)
 
-        # Train step (multi-GPU or single GPU)
+        # Train step
         if use_multi_gpu:
-            # Shard batch and RNG across devices
             batch = shard_batch(batch, NUM_DEVICES)
             step_rngs = jax.random.split(step_rng, NUM_DEVICES)
             state, metrics = train_step_fn(state, batch, step_rngs)
-            # Get metrics from first device (they're averaged via pmean)
             metrics = {k: v[0] for k, v in metrics.items()}
         else:
             state, metrics = train_step_single(
@@ -591,7 +744,6 @@ def train(config: Config):
         if step > 0 and step % config.training.eval_every == 0:
             print(f"\nEvaluating at step {step}...")
 
-            # Get unreplicated state for evaluation (multi-GPU)
             eval_state = unreplicate(state) if use_multi_gpu else state
 
             # Validation loss
@@ -612,12 +764,14 @@ def train(config: Config):
                 eval_state,
                 env_info["env"],
                 config,
+                norm_stats=env_info["norm_stats"],
+                task_type=env_info.get("task_type", "antmaze"),
                 num_episodes=config.training.eval_episodes,
             )
             print(f"Policy eval: success_rate={eval_metrics['success_rate']:.3f}, "
                   f"avg_steps={eval_metrics['avg_steps']:.1f}")
 
-            # Save best model (use unreplicated state)
+            # Save best model
             if eval_metrics["success_rate"] > best_success_rate:
                 best_success_rate = eval_metrics["success_rate"]
                 checkpoints.save_checkpoint(
@@ -628,10 +782,17 @@ def train(config: Config):
                     keep=1,
                 )
                 print(f"New best model saved! Success rate: {best_success_rate:.3f}")
+                
+                # Save training state
+                with open(os.path.join(output_dir, "training_state.json"), "w") as f:
+                    json.dump({
+                        "best_success_rate": best_success_rate,
+                        "best_step": step,
+                    }, f)
 
             print()
 
-        # Save checkpoint (use unreplicated state for multi-GPU)
+        # Save checkpoint
         if step > 0 and step % config.training.save_every == 0:
             save_state = unreplicate(state) if use_multi_gpu else state
             checkpoints.save_checkpoint(
@@ -640,6 +801,13 @@ def train(config: Config):
                 step,
                 keep=3,
             )
+            
+            # Also save training state
+            with open(os.path.join(output_dir, "training_state.json"), "w") as f:
+                json.dump({
+                    "best_success_rate": best_success_rate,
+                    "current_step": step,
+                }, f)
     
     print(f"\nTraining complete! Best success rate: {best_success_rate:.3f}")
     
@@ -652,14 +820,20 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, default="ut_gcdt_full",
                        choices=["gcdt_baseline", "ut_gcdt", "ut_gcdt_plan", "ut_gcdt_full",
-                                "ut_gcdt_gated", "ut_gcdt_gated_full"])
+                                "ut_gcdt_gated", "ut_gcdt_gated_full", "ut_gcdt_multiblock"])
     parser.add_argument("--dataset", type=str, default="antmaze-medium-stitch-v0")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output_dir", type=str, default="./outputs")
-    # Training overrides for fast iteration
+    
+    # Resume training
+    parser.add_argument("--resume", type=str, default=None,
+                       help="Path to checkpoint directory to resume training from")
+    
+    # Training overrides
     parser.add_argument("--max_steps", type=int, default=None, help="Override max training steps")
     parser.add_argument("--eval_episodes", type=int, default=None, help="Override eval episodes")
     parser.add_argument("--eval_every", type=int, default=None, help="Override eval frequency")
+    
     args = parser.parse_args()
     
     # Get config
@@ -670,6 +844,7 @@ if __name__ == "__main__":
         get_ut_gcdt_full_config,
         get_ut_gcdt_gated_config,
         get_ut_gcdt_gated_full_config,
+        get_ut_gcdt_multiblock_config,
     )
 
     config_map = {
@@ -679,6 +854,7 @@ if __name__ == "__main__":
         "ut_gcdt_full": get_ut_gcdt_full_config,
         "ut_gcdt_gated": get_ut_gcdt_gated_config,
         "ut_gcdt_gated_full": get_ut_gcdt_gated_full_config,
+        "ut_gcdt_multiblock": get_ut_gcdt_multiblock_config,
     }
     
     config = config_map[args.config]()
@@ -694,4 +870,5 @@ if __name__ == "__main__":
     if args.eval_every is not None:
         config.training.eval_every = args.eval_every
 
-    train(config)
+    # Train with optional resume
+    train(config, resume_from=args.resume)

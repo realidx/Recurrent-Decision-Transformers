@@ -26,17 +26,17 @@ class ModelConfig:
     # For Multi-Block UT-GCDT: multiple unique blocks cycled repeatedly
     # Total updates = num_blocks * num_cycles
     # E.g., num_blocks=2, num_cycles=6 -> 12 total updates
-    num_blocks: int = 2  # Number of unique transformer blocks
-    num_cycles: int = 6  # Number of times to cycle through all blocks
+    num_blocks: int = 1  # Number of unique transformer blocks
+    num_cycles: int = 1  # Number of times to cycle through all blocks
     
     # Step embeddings for UT iterations
     use_step_embeddings: bool = True
-    step_embedding_type: str = "learned"  # "learned" or "sinusoidal"
+    step_embedding_type: str = "sinusoidal"  # "learned" or "sinusoidal"
 
     # Gated recurrent loop (URM-style)
     # H_{k+1} = (1-g) * H_k + g * Block(H_k)
     # Helps with gradient flow and allows model to control update magnitude
-    use_gated_loop: bool = False
+    use_gated_loop: bool = True
 
     # Plan token
     use_plan_token: bool = True
@@ -64,7 +64,7 @@ class AuxiliaryConfig:
 class TrainingConfig:
     """Training configuration."""
     # Optimization
-    learning_rate: float = 0.0001
+    learning_rate: float = 0.0002
     weight_decay: float = 0.1
     warmup_steps: int = 1000
     max_steps: int = 100000
@@ -77,7 +77,7 @@ class TrainingConfig:
     
     # Evaluation
     eval_every: int = 10000
-    eval_episodes: int = 50
+    eval_episodes: int = 10
     
     # Logging
     log_every: int = 1000
@@ -160,7 +160,7 @@ def get_gcdt_baseline_config() -> Config:
     config.model.use_weight_tying = False
     config.model.use_plan_token = False
     config.model.use_step_embeddings = False
-    config.aux.use_waypoint_loss = False
+    config.aux.use_waypoint_loss = True
     # Enable deep supervision for independent heads
     config.aux.deep_supervision = True
     return config
@@ -290,7 +290,7 @@ def get_ut_gcdt_multiblock_config() -> Config:
     config.model.use_plan_token = True
     config.model.use_step_embeddings = True
     config.model.step_embedding_type = "sinusoidal"
-    config.model.use_gated_loop = False
+    config.model.use_gated_loop = True
     config.aux.use_waypoint_loss = True
     config.aux.deep_supervision = True
     return config

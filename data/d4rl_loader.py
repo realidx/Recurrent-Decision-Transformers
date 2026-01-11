@@ -1,4 +1,10 @@
-"""Data loading utilities for D4RL datasets."""
+"""Data loading utilities for D4RL datasets - FIXED VERSION.
+
+Key fixes:
+1. Action leakage: Last action in input is now zeroed, target is the NEXT action
+2. Goal normalization: Correct shape handling for antmaze (2D goals)
+3. Debug prints added for verification
+"""
 
 import jax.numpy as jnp
 import numpy as np
@@ -11,25 +17,29 @@ class NormalizationStats:
     """Statistics for normalizing observations."""
     obs_mean: np.ndarray
     obs_std: np.ndarray
-    goal_mean: np.ndarray  # For antmaze: just xy coords
-    goal_std: np.ndarray
+    goal_mean: np.ndarray  # For antmaze: shape (2,) for xy coords
+    goal_std: np.ndarray   # For antmaze: shape (2,)
 
 
 @dataclass
 class TrajectoryBatch:
     """Batch of trajectory data for GCDT training."""
     states: np.ndarray       # (batch, context_len, state_dim)
-    actions: np.ndarray      # (batch, context_len, action_dim)
+    actions: np.ndarray      # (batch, context_len, action_dim) - last action is ZEROED
     goals: np.ndarray        # (batch, goal_dim)
     timesteps: np.ndarray    # (batch, context_len)
-    target_actions: np.ndarray  # (batch, action_dim) - action to predict
+    target_actions: np.ndarray  # (batch, action_dim) - action to predict (NEXT action)
     future_states: np.ndarray   # (batch, state_dim) - for waypoint loss
 
 
 class D4RLDataset:
     """
     Dataset wrapper for D4RL that provides trajectory sampling for GCDT.
-
+    
+    CRITICAL FIX: Prevents action leakage by:
+    1. Zeroing the last action in the input sequence
+    2. Target action is the action AFTER the last state in context
+    
     Supports:
     - AntMaze tasks (goal-conditioned navigation)
     - Kitchen tasks (sequential manipulation)
@@ -44,10 +54,10 @@ class D4RLDataset:
         min_goal_horizon: int = 1,
         max_goal_horizon: int = 50,
         waypoint_horizon: int = 10,
-        task_type: str = "antmaze",  # "antmaze" or "kitchen"
+        task_type: str = "antmaze",
         normalize: bool = True,
         norm_stats: Optional[NormalizationStats] = None,
-        her_relabel_prob: float = 0.8,  # HER: probability of relabeling to achieved goal
+        her_relabel_prob: float = 0.8,
     ):
         """
         Args:
@@ -68,15 +78,13 @@ class D4RLDataset:
         self.terminals = dataset.get("terminals", dataset.get("dones", np.zeros(len(self.observations))))
         self.timeouts = dataset.get("timeouts", np.zeros(len(self.observations)))
 
-        # For antmaze, extract goal positions from observations
-        # AntMaze obs format: [qpos, qvel, goal_xy] where goal is last 2 dims
         self.task_type = task_type
         self.env = env
         self.normalize = normalize
         self.her_relabel_prob = her_relabel_prob
 
         if task_type == "antmaze":
-            # Goals are the target xy position (last 2 dims of observation)
+            # Goals are the target xy position (first 2 dims of observation)
             self.goal_dim = 2
             # Extract achieved positions (first 2 dims are xy position)
             self.achieved_goals = self.observations[:, :2]
@@ -93,6 +101,21 @@ class D4RLDataset:
                 self.norm_stats = norm_stats
             else:
                 self.norm_stats = self._compute_norm_stats()
+            
+            # CRITICAL: Verify normalization stats shapes
+            print(f"=== Normalization Stats Shapes ===")
+            print(f"obs_mean shape: {self.norm_stats.obs_mean.shape}")
+            print(f"obs_std shape: {self.norm_stats.obs_std.shape}")
+            print(f"goal_mean shape: {self.norm_stats.goal_mean.shape}")
+            print(f"goal_std shape: {self.norm_stats.goal_std.shape}")
+            print(f"goal_dim: {self.goal_dim}")
+            
+            # Verify goal stats match goal_dim
+            assert self.norm_stats.goal_mean.shape[0] == self.goal_dim, \
+                f"Goal mean shape {self.norm_stats.goal_mean.shape} doesn't match goal_dim {self.goal_dim}"
+            assert self.norm_stats.goal_std.shape[0] == self.goal_dim, \
+                f"Goal std shape {self.norm_stats.goal_std.shape} doesn't match goal_dim {self.goal_dim}"
+            
             print(f"Normalization: obs_mean range [{self.norm_stats.obs_mean.min():.2f}, {self.norm_stats.obs_mean.max():.2f}], "
                   f"goal_mean range [{self.norm_stats.goal_mean.min():.2f}, {self.norm_stats.goal_mean.max():.2f}]")
         else:
@@ -110,63 +133,13 @@ class D4RLDataset:
         # Build trajectory index for efficient sampling
         self._build_trajectory_index()
 
-    def _build_trajectory_index(self):
-        """Build index of trajectory boundaries for efficient sampling."""
-        # Episode ends when terminal OR timeout
-        episode_ends = np.logical_or(self.terminals, self.timeouts)
-        end_indices = np.where(episode_ends)[0]
-
-        self.trajectory_starts = [0]
-        self.trajectory_ends = []
-
-        for end_idx in end_indices:
-            self.trajectory_ends.append(end_idx + 1)
-            if end_idx + 1 < len(self.observations):
-                self.trajectory_starts.append(end_idx + 1)
-
-        # Handle case where last trajectory doesn't end
-        if len(self.trajectory_ends) < len(self.trajectory_starts):
-            self.trajectory_ends.append(len(self.observations))
-
-        self.trajectory_starts = np.array(self.trajectory_starts)
-        self.trajectory_ends = np.array(self.trajectory_ends)
-        self.trajectory_lengths = self.trajectory_ends - self.trajectory_starts
-
-        # Filter out trajectories that are too short
-        min_len = self.context_len + max(self.max_goal_horizon, self.waypoint_horizon)
-        valid_trajs = self.trajectory_lengths >= min_len
-        self.trajectory_starts = self.trajectory_starts[valid_trajs]
-        self.trajectory_ends = self.trajectory_ends[valid_trajs]
-        self.trajectory_lengths = self.trajectory_lengths[valid_trajs]
-
-        self.num_trajectories = len(self.trajectory_starts)
-
-        if self.num_trajectories == 0:
-            # Fallback: use shorter minimum length
-            min_len = self.context_len + 1
-            self.trajectory_starts = np.array([0])
-            self.trajectory_ends = np.array([len(self.observations)])
-            self.trajectory_lengths = self.trajectory_ends - self.trajectory_starts
-            valid_trajs = self.trajectory_lengths >= min_len
-            self.trajectory_starts = self.trajectory_starts[valid_trajs]
-            self.trajectory_ends = self.trajectory_ends[valid_trajs]
-            self.trajectory_lengths = self.trajectory_lengths[valid_trajs]
-            self.num_trajectories = len(self.trajectory_starts)
-
-        # Create sampling weights proportional to usable length
-        usable_lengths = np.maximum(self.trajectory_lengths - min_len + 1, 1)
-        self.traj_weights = usable_lengths / usable_lengths.sum()
-
-        print(f"Built trajectory index: {self.num_trajectories} valid trajectories")
-        if self.num_trajectories > 0:
-            print(f"Trajectory length stats: min={self.trajectory_lengths.min()}, "
-                  f"max={self.trajectory_lengths.max()}, mean={self.trajectory_lengths.mean():.1f}")
-
     def _compute_norm_stats(self) -> NormalizationStats:
-        """Compute normalization statistics from dataset."""
+        """Compute normalization statistics from data."""
         obs_mean = self.observations.mean(axis=0)
-        obs_std = self.observations.std(axis=0) + 1e-6  # Avoid division by zero
+        obs_std = self.observations.std(axis=0) + 1e-6
 
+        # CRITICAL FIX: Goal stats should be computed from achieved_goals
+        # which has the correct dimensionality (2 for antmaze, full state for kitchen)
         goal_mean = self.achieved_goals.mean(axis=0)
         goal_std = self.achieved_goals.std(axis=0) + 1e-6
 
@@ -188,12 +161,66 @@ class D4RLDataset:
         if self.norm_stats is None:
             return goal
         return (goal - self.norm_stats.goal_mean) / self.norm_stats.goal_std
+    
+    def unnormalize_obs(self, obs: np.ndarray) -> np.ndarray:
+        """Unnormalize observations."""
+        if self.norm_stats is None:
+            return obs
+        return obs * self.norm_stats.obs_std + self.norm_stats.obs_mean
+
+    def _build_trajectory_index(self):
+        """Build index of trajectory boundaries for efficient sampling."""
+        # Find episode boundaries (terminal OR timeout)
+        episode_ends = np.where(np.logical_or(self.terminals, self.timeouts))[0]
+
+        self.trajectory_starts = [0]
+        self.trajectory_ends = []
+
+        for end_idx in episode_ends:
+            self.trajectory_ends.append(end_idx + 1)
+            if end_idx + 1 < len(self.observations):
+                self.trajectory_starts.append(end_idx + 1)
+
+        # Handle case where last trajectory doesn't end with terminal/timeout
+        if len(self.trajectory_ends) < len(self.trajectory_starts):
+            self.trajectory_ends.append(len(self.observations))
+
+        self.trajectory_starts = np.array(self.trajectory_starts)
+        self.trajectory_ends = np.array(self.trajectory_ends)
+        self.trajectory_lengths = self.trajectory_ends - self.trajectory_starts
+
+        # Filter out trajectories that are too short
+        # Need: context_len states + 1 extra for target action + goal horizon
+        min_len = self.context_len + 1 + self.min_goal_horizon
+        valid_trajs = self.trajectory_lengths >= min_len
+        self.trajectory_starts = self.trajectory_starts[valid_trajs]
+        self.trajectory_ends = self.trajectory_ends[valid_trajs]
+        self.trajectory_lengths = self.trajectory_lengths[valid_trajs]
+
+        self.num_trajectories = len(self.trajectory_starts)
+
+        # Create sampling weights proportional to usable length
+        usable_lengths = self.trajectory_lengths - min_len + 1
+        self.traj_weights = usable_lengths / usable_lengths.sum()
+
+        print(f"Built trajectory index: {self.num_trajectories} valid trajectories")
+        print(f"Trajectory length stats: min={self.trajectory_lengths.min()}, "
+              f"max={self.trajectory_lengths.max()}, mean={self.trajectory_lengths.mean():.1f}")
 
     def sample_batch(self, batch_size: int, rng: np.random.Generator) -> TrajectoryBatch:
         """
         Sample a batch of trajectory contexts with goals.
+        
+        CRITICAL FIX: Action leakage prevention
+        - Input actions: [a_0, a_1, ..., a_{t-2}, ZERO]  (last action zeroed)
+        - Target action: a_{t-1} (the action we want to predict)
+        - We predict: given s_{t-1}, what action should we take?
+        
+        Sequence structure:
+        - States: s_0, s_1, ..., s_{t-1}  (context_len states)
+        - Actions: a_0, a_1, ..., a_{t-2}, 0  (context_len actions, last zeroed)
+        - Target: a_{t-1} (action to predict from s_{t-1})
         """
-        # Sample trajectories
         traj_indices = rng.choice(
             self.num_trajectories,
             size=batch_size,
@@ -213,18 +240,27 @@ class D4RLDataset:
             traj_len = traj_end - traj_start
 
             # Sample starting point within trajectory
-            max_start = max(0, traj_len - self.context_len - 1)
+            # Need room for: context_len states + 1 for target action + goal horizon
+            max_start = max(0, traj_len - self.context_len - 1 - self.min_goal_horizon)
             start_offset = rng.integers(0, max_start + 1)
 
             # Extract context
             ctx_start = traj_start + start_offset
-            ctx_end = min(ctx_start + self.context_len, traj_end)
+            ctx_end = min(ctx_start + self.context_len, traj_end - 1)  # -1 to leave room for target
             actual_ctx_len = ctx_end - ctx_start
 
+            # States: s_0 to s_{t-1}
             states = self.observations[ctx_start:ctx_end]
-            actions = self.actions[ctx_start:ctx_end]
+            
+            # Actions: a_0 to a_{t-2}, with last position ZEROED
+            # This is the key fix - we don't give the model the answer!
+            actions = self.actions[ctx_start:ctx_end].copy()  # a_0 to a_{t-1}
+            actions[-1] = 0.0  # Zero out last action to prevent leakage
+            
+            # Target action: a_{t-1} - what the model should predict
+            target_action = self.actions[ctx_end - 1]  # The action at the last state
 
-            # Pad if needed
+            # Pad if needed (beginning of trajectory)
             if actual_ctx_len < self.context_len:
                 pad_len = self.context_len - actual_ctx_len
                 states = np.concatenate([
@@ -232,45 +268,34 @@ class D4RLDataset:
                     states
                 ], axis=0)
                 actions = np.concatenate([
-                    np.tile(actions[0:1], (pad_len, 1)),
+                    np.zeros((pad_len, self.action_dim)),  # Pad with zeros
                     actions
                 ], axis=0)
 
             timesteps = np.arange(self.context_len)
 
-            # Target action is the last action in context
-            target_action = actions[-1]
-
-            # Goal sampling with Hindsight Experience Replay (HER)
-            # Key insight: 80% of time, use trajectory's FINAL achieved state as goal
-            # This teaches "how to reach where I actually ended up" - enables stitching
+            # Goal sampling with HER
             use_her = rng.random() < self.her_relabel_prob
-
+            
             if use_her:
-                # HER: Use the final achieved state of this trajectory as goal
-                # This is the key to learning from "failed" trajectories
-                final_state_idx = traj_end - 1
-                goal = self.achieved_goals[final_state_idx]
-                # Waypoint should also be relative to where we're heading
-                # Use a state between current position and trajectory end
-                waypoint_idx = min(ctx_end - 1 + self.waypoint_horizon, traj_end - 1)
+                # HER: Use final achieved state as goal (enables stitching)
+                goal_idx = traj_end - 1
             else:
-                # Original behavior: sample future state as goal
-                if self.goal_sampling == "future":
-                    max_horizon = min(self.max_goal_horizon, traj_end - ctx_end)
-                    if max_horizon > self.min_goal_horizon:
-                        goal_horizon = rng.integers(self.min_goal_horizon, max_horizon + 1)
-                    else:
-                        goal_horizon = max(1, max_horizon)
-                    goal_idx = min(ctx_end - 1 + goal_horizon, traj_end - 1)
-                    goal = self.achieved_goals[goal_idx]
-                else:
-                    # Random goal from dataset (for diversity)
-                    goal_idx = rng.integers(0, len(self.achieved_goals))
-                    goal = self.achieved_goals[goal_idx]
-                waypoint_idx = min(ctx_end - 1 + self.waypoint_horizon, traj_end - 1)
+                # Sample goal from future in same trajectory
+                goal_horizon = rng.integers(
+                    self.min_goal_horizon,
+                    min(self.max_goal_horizon + 1, traj_end - ctx_end)
+                )
+                goal_idx = min(ctx_end + goal_horizon, traj_end - 1)
+            
+            # Extract goal (xy position for antmaze, full state for kitchen)
+            if self.task_type == "antmaze":
+                goal = self.achieved_goals[goal_idx]  # Shape: (2,)
+            else:
+                goal = self.observations[goal_idx]  # Shape: (state_dim,)
 
-            # Future state for waypoint loss (goal-relative planning)
+            # Future state for waypoint loss
+            waypoint_idx = min(ctx_end + self.waypoint_horizon, traj_end - 1)
             future_state = self.observations[waypoint_idx]
 
             states_batch.append(states)
@@ -280,25 +305,31 @@ class D4RLDataset:
             target_actions_batch.append(target_action)
             future_states_batch.append(future_state)
 
-        # Stack and apply normalization
+        # Stack all batches
         states_arr = np.stack(states_batch)
+        actions_arr = np.stack(actions_batch)
         goals_arr = np.stack(goals_batch)
         future_states_arr = np.stack(future_states_batch)
+        target_actions_arr = np.stack(target_actions_batch)
 
+        # Apply normalization
         if self.normalize and self.norm_stats is not None:
-            # Normalize states: (batch, seq, dim) -> apply per-dim normalization
+            # Normalize states: (batch, seq, dim)
             states_arr = (states_arr - self.norm_stats.obs_mean) / self.norm_stats.obs_std
-            # Normalize goals: (batch, goal_dim)
+            
+            # Normalize goals: (batch, goal_dim) 
+            # CRITICAL: Use goal_mean/goal_std which have correct shape
             goals_arr = (goals_arr - self.norm_stats.goal_mean) / self.norm_stats.goal_std
+            
             # Normalize future states for waypoint loss
             future_states_arr = (future_states_arr - self.norm_stats.obs_mean) / self.norm_stats.obs_std
 
         return TrajectoryBatch(
             states=states_arr,
-            actions=np.stack(actions_batch),
+            actions=actions_arr,  # Last action is ZEROED
             goals=goals_arr,
             timesteps=np.stack(timesteps_batch),
-            target_actions=np.stack(target_actions_batch),
+            target_actions=target_actions_arr,
             future_states=future_states_arr,
         )
 
@@ -340,7 +371,6 @@ def get_task_type(dataset_name: str) -> str:
     elif "kitchen" in dataset_name:
         return "kitchen"
     else:
-        # Default to treating as generic (full state as goal)
         return "kitchen"
 
 
@@ -352,60 +382,38 @@ def load_d4rl_dataset(
 ) -> Tuple[D4RLDataset, D4RLDataset, Dict]:
     """
     Load D4RL dataset and create train/val datasets.
-
-    Args:
-        dataset_name: D4RL dataset name (e.g., "antmaze-umaze-v2")
-        context_len: Number of (state, action) pairs in context
-        train_split: Fraction of data for training
-        **kwargs: Additional arguments for D4RLDataset
-
-    Returns:
-        train_dataset: D4RLDataset for training
-        val_dataset: D4RLDataset for validation
-        env_info: Dictionary with state_dim, action_dim, goal_dim, env
     """
     import gym
     import d4rl
 
-    # Create environment
     env = gym.make(dataset_name)
-
-    # Get dataset
     dataset = d4rl.qlearning_dataset(env)
 
-    # Get dimensions
     state_dim = env.observation_space.shape[0]
     action_dim = env.action_space.shape[0]
 
     task_type = get_task_type(dataset_name)
 
-    # Split into train/val
+    # Split into train/val by trajectory boundaries
     n_samples = len(dataset["observations"])
-    n_train = int(n_samples * train_split)
-
-    # Split by trajectory boundaries for cleaner separation
     terminals = dataset.get("terminals", dataset.get("dones", np.zeros(n_samples)))
     timeouts = dataset.get("timeouts", np.zeros(n_samples))
     episode_ends = np.where(np.logical_or(terminals, timeouts))[0]
 
     if len(episode_ends) > 1:
-        # Find split point near train_split fraction
         split_idx = int(len(episode_ends) * train_split)
         split_point = episode_ends[split_idx] + 1
     else:
-        split_point = n_train
+        split_point = int(n_samples * train_split)
 
-    train_data = {
-        k: v[:split_point] for k, v in dataset.items()
-    }
-    val_data = {
-        k: v[split_point:] for k, v in dataset.items()
-    }
+    train_data = {k: v[:split_point] for k, v in dataset.items()}
+    val_data = {k: v[split_point:] for k, v in dataset.items()}
 
     print(f"Dataset: {dataset_name}")
     print(f"Total samples: {n_samples}, Train: {len(train_data['observations'])}, Val: {len(val_data['observations'])}")
+    print(f"State dim: {state_dim}, Action dim: {action_dim}")
 
-    # Create train dataset (computes normalization stats)
+    # Create train dataset
     train_dataset = D4RLDataset(
         dataset=train_data,
         env=env,
@@ -415,14 +423,14 @@ def load_d4rl_dataset(
         **kwargs
     )
 
-    # Create val dataset using same normalization stats as train
+    # Create val dataset using same normalization stats
     val_dataset = D4RLDataset(
         dataset=val_data,
         env=env,
         context_len=context_len,
         task_type=task_type,
         normalize=True,
-        norm_stats=train_dataset.norm_stats,  # Use train stats!
+        norm_stats=train_dataset.norm_stats,
         **kwargs
     )
 
@@ -438,7 +446,7 @@ def load_d4rl_dataset(
         "goal_dim": goal_dim,
         "env": env,
         "task_type": task_type,
-        "norm_stats": train_dataset.norm_stats,  # Include for eval
+        "norm_stats": train_dataset.norm_stats,
     }
 
     return train_dataset, val_dataset, env_info
@@ -454,3 +462,54 @@ def batch_to_jax(batch: TrajectoryBatch) -> Dict[str, jnp.ndarray]:
         "target_actions": jnp.array(batch.target_actions),
         "future_states": jnp.array(batch.future_states),
     }
+
+
+# ============================================================================
+# DEBUG UTILITIES
+# ============================================================================
+
+def verify_batch(batch: TrajectoryBatch, verbose: bool = True) -> bool:
+    """
+    Verify batch doesn't have action leakage.
+    
+    Returns True if batch is valid, False if there's leakage.
+    """
+    # Check that last action in input is zero
+    last_actions = batch.actions[:, -1, :]  # (batch, action_dim)
+    is_zero = np.allclose(last_actions, 0.0)
+    
+    if verbose:
+        print("=== Batch Verification ===")
+        print(f"States shape: {batch.states.shape}")
+        print(f"Actions shape: {batch.actions.shape}")
+        print(f"Goals shape: {batch.goals.shape}")
+        print(f"Target actions shape: {batch.target_actions.shape}")
+        print(f"Last action in input (should be ~0): {last_actions[0, :3]}")
+        print(f"Target action (what we predict): {batch.target_actions[0, :3]}")
+        print(f"Last action is zeroed: {is_zero}")
+        
+        if not is_zero:
+            print("WARNING: Last action is NOT zeroed - potential action leakage!")
+    
+    return is_zero
+
+
+if __name__ == "__main__":
+    # Test the data loader
+    print("Testing D4RLDataset with action leakage fix...")
+    
+    train_dataset, val_dataset, env_info = load_d4rl_dataset(
+        "antmaze-umaze-v2",
+        context_len=20,
+    )
+    
+    loader = DataLoader(train_dataset, batch_size=32, seed=42)
+    batch = loader.get_batch()
+    
+    # Verify the batch
+    is_valid = verify_batch(batch, verbose=True)
+    
+    if is_valid:
+        print("\n✓ Batch verification PASSED - no action leakage detected")
+    else:
+        print("\n✗ Batch verification FAILED - action leakage detected!")
