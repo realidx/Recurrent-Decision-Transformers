@@ -213,13 +213,11 @@ def compute_loss(
     if "intermediate_action_preds" in outputs and aux_deep_supervision:
         intermediate_preds = outputs["intermediate_action_preds"]
         if len(intermediate_preds) >= 1:
-            # Progressive weighting: later iterations weighted more
-            total_loss = 0.0
-            num_preds = len(intermediate_preds)
-            for k, pred in enumerate(intermediate_preds):
-                step_weight = (k + 1) / num_preds
-                total_loss += step_weight * jnp.mean((pred - target_actions) ** 2)
+            # Sum MSE across all steps/layers (no weighting)
+            total_loss = sum(jnp.mean((pred - target_actions) ** 2) 
+                            for pred in intermediate_preds)
             metrics["deep_action_loss"] = total_loss
+            # Log final step loss separately for monitoring
             metrics["action_loss"] = jnp.mean((intermediate_preds[-1] - target_actions) ** 2)
         else:
             total_loss = action_loss
@@ -359,7 +357,7 @@ def evaluate_policy(
     norm_stats,
     task_type: str = "antmaze",
     num_episodes: int = 10,
-    max_steps: int = 600,
+    max_steps: int = 1000,
 ) -> Dict[str, float]:
     """Evaluate the current policy in the environment."""
     
@@ -389,17 +387,45 @@ def evaluate_policy(
         else:
             obs = reset_result
             info = {}
+
+        # At the start of evaluate_policy, after env.reset():
+        print(f"obs[:2] (agent position in obs space): {obs[:2]}")
+        print(f"env.unwrapped.target_goal: {env.unwrapped.target_goal}")
+
+        if hasattr(env.unwrapped, 'sim'):
+            print(f"env.unwrapped.sim.data.qpos[:2]: {env.unwrapped.sim.data.qpos[:2]}")
+        if hasattr(env.unwrapped, 'get_xy'):
+            print(f"env.unwrapped.get_xy(): {env.unwrapped.get_xy()}")
         
         # Get goal based on task type
         if task_type == "antmaze":
-            if hasattr(env, 'target_goal'):
-                goal_raw = np.array(env.target_goal)
-            elif hasattr(env.unwrapped, 'target_goal'):
+            # Try multiple methods to get the correct goal
+            goal_raw = None
+            
+            # Method 1: Check unwrapped env first
+            if hasattr(env.unwrapped, 'target_goal'):
                 goal_raw = np.array(env.unwrapped.target_goal)
-            else:
-                goal_raw = obs[:2]
-        else:
-            goal_raw = info.get("goal", obs.copy())
+            
+            # Method 2: Check wrapped env
+            if goal_raw is None and hasattr(env, 'target_goal'):
+                goal_raw = np.array(env.target_goal)
+                print(f"DEBUG Method 2: {goal_raw}")
+            
+            # Method 3: Get from info dict
+            if goal_raw is None and 'goal' in info:
+                goal_raw = np.array(info['goal'])[:2]
+                print(f"DEBUG Method 3: {goal_raw}")
+            
+            # Method 4: For some D4RL versions, goal is in observation
+            if goal_raw is None:
+                goal_raw = obs[:2]  # Fallback to agent position (wrong but safe)
+                print(f"DEBUG Method 4 (fallback): {goal_raw}")
+            
+            # SANITY CHECK: Goals should be within maze bounds
+            # For medium maze: roughly x in [0, 20], y in [0, 20]
+            # But actual reachable area is smaller
+            if goal_raw[0] > 25 or goal_raw[1] > 25:
+                print(f"WARNING: Goal {goal_raw} seems too large! Check goal extraction.")
         
         # Normalize goal and observation
         goal_normalized = (goal_raw - goal_mean) / goal_std
@@ -454,11 +480,6 @@ def evaluate_policy(
             
             action = np.array(get_action(state.params, states_input, actions_input, 
                              goals_input, timesteps_input)[0])
-            
-            # Action smoothing
-            if len(actions_buffer) > 0:
-                prev_action = actions_buffer[-1]
-                action = 0.7 * action + 0.3 * prev_action
 
             action = np.clip(action, env.action_space.low, env.action_space.high)
             
@@ -467,6 +488,8 @@ def evaluate_policy(
             if len(step_result) == 5:
                 obs, reward, terminated, truncated, info = step_result
                 done = terminated or truncated
+                if done:
+                    print(f"terminated={terminated}, truncated={truncated}")
             else:
                 obs, reward, done, info = step_result
                 dist_to_goal = np.linalg.norm(obs[:2] - goal_raw)
@@ -475,6 +498,10 @@ def evaluate_policy(
             
             if ep == 0 and steps % 50 == 0:
                 print(f"Step {steps}: pos={obs[:2]}, dist_to_goal={dist_to_goal}")
+
+            # if ep == 0 and steps % 50 == 0:
+                # print(f"Action pred: {action}")
+                # print(f"Action bounds: [{env.action_space.low}, {env.action_space.high}]")
 
             # Normalize new observation
             obs_normalized = (obs - obs_mean) / obs_std
@@ -486,7 +513,7 @@ def evaluate_policy(
             
             # Check success by distance (threshold = 0.5 for antmaze)
             
-            if dist_to_goal < 0.5:
+            if dist_to_goal < 1.0:
                 success = True
                 break
 

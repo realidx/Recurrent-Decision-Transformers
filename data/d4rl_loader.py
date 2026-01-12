@@ -211,15 +211,15 @@ class D4RLDataset:
         """
         Sample a batch of trajectory contexts with goals.
         
-        CRITICAL FIX: Action leakage prevention
-        - Input actions: [a_0, a_1, ..., a_{t-2}, ZERO]  (last action zeroed)
-        - Target action: a_{t-1} (the action we want to predict)
-        - We predict: given s_{t-1}, what action should we take?
+        FIXED: Actions are shifted by 1 to match inference
+        - action[t] = action taken AFTER state[t-1], or 0 for t=0
+        - This way, at every position t, the model sees (s_t, a_{t-1}) and predicts a_t
         
         Sequence structure:
-        - States: s_0, s_1, ..., s_{t-1}  (context_len states)
-        - Actions: a_0, a_1, ..., a_{t-2}, 0  (context_len actions, last zeroed)
-        - Target: a_{t-1} (action to predict from s_{t-1})
+        Position:  0      1      2      ...   T-1
+        State:     s_0    s_1    s_2    ...   s_{T-1}
+        Action:    0      a_0    a_1    ...   a_{T-2}
+        Target:    a_{T-1}
         """
         traj_indices = rng.choice(
             self.num_trajectories,
@@ -240,27 +240,31 @@ class D4RLDataset:
             traj_len = traj_end - traj_start
 
             # Sample starting point within trajectory
-            # Need room for: context_len states + 1 for target action + goal horizon
             max_start = max(0, traj_len - self.context_len - 1 - self.min_goal_horizon)
             start_offset = rng.integers(0, max_start + 1)
 
-            # Extract context
             ctx_start = traj_start + start_offset
-            ctx_end = min(ctx_start + self.context_len, traj_end - 1)  # -1 to leave room for target
+            ctx_end = min(ctx_start + self.context_len, traj_end - 1)
             actual_ctx_len = ctx_end - ctx_start
 
-            # States: s_0 to s_{t-1}
+            # States: s_0 to s_{T-1} (T = actual_ctx_len)
             states = self.observations[ctx_start:ctx_end]
             
-            # Actions: a_0 to a_{t-2}, with last position ZEROED
-            # This is the key fix - we don't give the model the answer!
-            actions = self.actions[ctx_start:ctx_end].copy()  # a_0 to a_{t-1}
-            actions[-1] = 0.0  # Zero out last action to prevent leakage
+            # FIXED: Actions are SHIFTED by 1
+            # action[t] = a_{t-1} (action taken after seeing s_{t-1})
+            # action[0] = 0 (no previous action)
+            # action[T-1] = a_{T-2}
+            # Target = a_{T-1} (action to predict at s_{T-1})
             
-            # Target action: a_{t-1} - what the model should predict
-            target_action = self.actions[ctx_end - 1]  # The action at the last state
+            actions = np.zeros((actual_ctx_len, self.action_dim))
+            if actual_ctx_len > 1:
+                # Fill positions 1 to T-1 with actions a_0 to a_{T-2}
+                actions[1:] = self.actions[ctx_start:ctx_end - 1]
+            
+            # Target: a_{T-1} - the action we should take at s_{T-1}
+            target_action = self.actions[ctx_end - 1]
 
-            # Pad if needed (beginning of trajectory)
+            # Pad if needed (at beginning of context)
             if actual_ctx_len < self.context_len:
                 pad_len = self.context_len - actual_ctx_len
                 states = np.concatenate([
@@ -268,7 +272,7 @@ class D4RLDataset:
                     states
                 ], axis=0)
                 actions = np.concatenate([
-                    np.zeros((pad_len, self.action_dim)),  # Pad with zeros
+                    np.zeros((pad_len, self.action_dim)),
                     actions
                 ], axis=0)
 
@@ -278,21 +282,22 @@ class D4RLDataset:
             use_her = rng.random() < self.her_relabel_prob
             
             if use_her:
-                # HER: Use final achieved state as goal (enables stitching)
                 goal_idx = traj_end - 1
             else:
-                # Sample goal from future in same trajectory
-                goal_horizon = rng.integers(
-                    self.min_goal_horizon,
-                    min(self.max_goal_horizon + 1, traj_end - ctx_end)
-                )
+                # FIX: Ensure valid range for rng.integers
+                remaining = traj_end - ctx_end
+                max_horizon = max(self.min_goal_horizon + 1, min(self.max_goal_horizon + 1, remaining))
+                if max_horizon <= self.min_goal_horizon:
+                    goal_horizon = self.min_goal_horizon
+                else:
+                    goal_horizon = rng.integers(self.min_goal_horizon, max_horizon)
                 goal_idx = min(ctx_end + goal_horizon, traj_end - 1)
             
-            # Extract goal (xy position for antmaze, full state for kitchen)
+            # Extract goal
             if self.task_type == "antmaze":
-                goal = self.achieved_goals[goal_idx]  # Shape: (2,)
+                goal = self.achieved_goals[goal_idx]
             else:
-                goal = self.observations[goal_idx]  # Shape: (state_dim,)
+                goal = self.observations[goal_idx]
 
             # Future state for waypoint loss
             waypoint_idx = min(ctx_end + self.waypoint_horizon, traj_end - 1)
@@ -314,19 +319,13 @@ class D4RLDataset:
 
         # Apply normalization
         if self.normalize and self.norm_stats is not None:
-            # Normalize states: (batch, seq, dim)
             states_arr = (states_arr - self.norm_stats.obs_mean) / self.norm_stats.obs_std
-            
-            # Normalize goals: (batch, goal_dim) 
-            # CRITICAL: Use goal_mean/goal_std which have correct shape
             goals_arr = (goals_arr - self.norm_stats.goal_mean) / self.norm_stats.goal_std
-            
-            # Normalize future states for waypoint loss
             future_states_arr = (future_states_arr - self.norm_stats.obs_mean) / self.norm_stats.obs_std
 
         return TrajectoryBatch(
             states=states_arr,
-            actions=actions_arr,  # Last action is ZEROED
+            actions=actions_arr,
             goals=goals_arr,
             timesteps=np.stack(timesteps_batch),
             target_actions=target_actions_arr,
