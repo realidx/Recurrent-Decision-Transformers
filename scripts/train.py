@@ -170,27 +170,19 @@ def compute_loss(
     aux_use_waypoint_loss: bool,
     aux_deep_supervision: bool,
     waypoint_loss_weight: float,
+    gc_reg_weight: float,
+    gc_margin: float,
     rng: jax.random.PRNGKey,
     deterministic: bool = False,
+    step: int = 0,  # NEW: current training step for adaptive weighting
 ) -> Tuple[jnp.ndarray, Dict[str, jnp.ndarray]]:
     """
-    Compute training loss.
+    Compute training loss with adaptive goal-conditioning.
     
-    Args:
-        params: Model parameters
-        apply_fn: Model forward function
-        batch: Dictionary with states, actions, goals, timesteps, target_actions, future_states
-        aux_use_waypoint_loss: Whether to include waypoint loss
-        aux_deep_supervision: Whether to apply waypoint loss at each iteration
-        waypoint_loss_weight: Scale for waypoint loss
-        rng: Random key for dropout
-        deterministic: Whether to disable dropout
-        
-    Returns:
-        total_loss: Scalar loss
-        metrics: Dictionary of individual loss components
+    Key fix: Adaptive GC weight that increases when goal-conditioning collapses.
     """
-    # Forward pass
+    
+    # Forward pass with original goals
     outputs = apply_fn(
         params,
         states=batch["states"],
@@ -199,51 +191,131 @@ def compute_loss(
         timesteps=batch["timesteps"],
         deterministic=deterministic,
         return_intermediates=aux_deep_supervision,
-        rngs={"dropout": rng} if not deterministic else None,
+        rngs={"dropout": rng} if rng is not None else None,
     )
     
-    # Action prediction loss (MSE) - final layer/step only
     action_pred = outputs["action_pred"]
     target_actions = batch["target_actions"]
     action_loss = jnp.mean((action_pred - target_actions) ** 2)
 
     metrics = {"action_loss": action_loss}
 
-    # Deep supervision: Sum of MSE losses from ALL heads/steps
+    # Deep supervision loss
     if "intermediate_action_preds" in outputs and aux_deep_supervision:
-        intermediate_preds = outputs["intermediate_action_preds"]
-        if len(intermediate_preds) >= 1:
-            # Sum MSE across all steps/layers (no weighting)
-            total_loss = sum(jnp.mean((pred - target_actions) ** 2) 
-                            for pred in intermediate_preds)
-            metrics["deep_action_loss"] = total_loss
-            # Log final step loss separately for monitoring
-            metrics["action_loss"] = jnp.mean((intermediate_preds[-1] - target_actions) ** 2)
-        else:
-            total_loss = action_loss
+        preds = outputs["intermediate_action_preds"]
+        per_step = jnp.stack([jnp.mean((p - target_actions) ** 2) for p in preds], axis=0)
+        deep_action_loss = jnp.mean(per_step)
+        deep_weight = 0.1
+        total_loss = action_loss + deep_weight * deep_action_loss
+
+        metrics["deep_action_loss"] = deep_action_loss
+        metrics["action_loss"] = jnp.mean((preds[-1] - target_actions) ** 2)
     else:
         total_loss = action_loss
 
-    # Waypoint auxiliary loss
-    if aux_use_waypoint_loss and "waypoint_preds" in outputs:
+    # Waypoint loss with directional component
+    if aux_use_waypoint_loss and "waypoint_preds" in outputs and len(outputs["waypoint_preds"]) > 0:
         waypoint_preds = outputs["waypoint_preds"]
         future_states = batch["future_states"]
         
-        if aux_deep_supervision:
-            waypoint_loss = 0.0
-            for wp_pred in waypoint_preds:
-                waypoint_loss += jnp.mean((wp_pred - future_states) ** 2)
-            waypoint_loss /= len(waypoint_preds)
+        if aux_deep_supervision and len(waypoint_preds) > 1:
+            waypoint_loss = jnp.mean(jnp.stack([
+                jnp.mean((wp_pred - future_states) ** 2) 
+                for wp_pred in waypoint_preds
+            ]))
         else:
             waypoint_loss = jnp.mean((waypoint_preds[-1] - future_states) ** 2)
         
         waypoint_loss = waypoint_loss_weight * waypoint_loss
         metrics["waypoint_loss"] = waypoint_loss
-        total_loss += waypoint_loss
+        total_loss = total_loss + waypoint_loss
+        
+        # Directional waypoint loss
+        current_xy = batch["states"][:, -1, :2]
+        goal_xy = batch["goals"][:, :2]
+        waypoint_pred_xy = waypoint_preds[-1][:, :2]
+        
+        pred_delta = waypoint_pred_xy - current_xy
+        desired_delta = goal_xy - current_xy
+        
+        pred_delta_norm = pred_delta / (jnp.linalg.norm(pred_delta, axis=-1, keepdims=True) + 1e-8)
+        desired_delta_norm = desired_delta / (jnp.linalg.norm(desired_delta, axis=-1, keepdims=True) + 1e-8)
+        
+        cos_sim = jnp.sum(pred_delta_norm * desired_delta_norm, axis=-1)
+        
+        directional_margin = 0.3
+        directional_loss = jnp.mean(jnp.maximum(0.0, directional_margin - cos_sim))
+        
+        directional_weight = 0.05
+        metrics["directional_loss"] = directional_loss
+        metrics["waypoint_cos_sim"] = jnp.mean(cos_sim)
+        total_loss = total_loss + directional_weight * directional_loss
+
+    # ============================================================
+    # Goal-Conditioning Regularizer with Adaptive Weighting
+    # ============================================================
+    goals_shuffled = jnp.roll(batch["goals"], shift=1, axis=0)
+    
+    outputs_g2 = apply_fn(
+        params,
+        states=batch["states"],
+        actions=batch["actions"],
+        goals=goals_shuffled,
+        timesteps=batch["timesteps"],
+        deterministic=True,
+        return_intermediates=False,
+        rngs=None,
+    )
+    
+    action_pred_g1 = outputs["action_pred"]
+    action_pred_g2 = outputs_g2["action_pred"]
+    
+    action_diff = jnp.linalg.norm(action_pred_g1 - action_pred_g2, axis=-1)
+    
+    gc_loss_per_sample = jnp.maximum(0.0, gc_margin - action_diff)
+    gc_loss = jnp.mean(gc_loss_per_sample)
+    
+    metrics["gc_loss"] = gc_loss
+    metrics["gc_action_diff"] = jnp.mean(action_diff)
+    
+    # ============================================================
+    # FIX 4: Adaptive GC weight
+    # Increase weight when gc_action_diff is low (model ignoring goal)
+    # ============================================================
+    if rng is not None:
+        # Base weight + adaptive component
+        # When action_diff < margin, increase weight
+        adaptive_multiplier = jnp.where(
+            jnp.mean(action_diff) < gc_margin * 0.5,  # If diff < half the margin
+            2.0,  # Double the weight
+            1.0   # Normal weight
+        )
+        effective_gc_weight = gc_reg_weight * adaptive_multiplier
+        
+        # Also ramp up GC weight over training (schedule)
+        # Start with 0.5x, reach 1.0x at step 10000
+        warmup_factor = jnp.minimum(1.0, step / 10000.0)
+        warmup_factor = jnp.maximum(0.5, warmup_factor)
+        
+        effective_gc_weight = effective_gc_weight * warmup_factor
+        
+        metrics["effective_gc_weight"] = effective_gc_weight
+        total_loss = total_loss + effective_gc_weight * gc_loss
     
     metrics["total_loss"] = total_loss
     
     return total_loss, metrics
+
+
+def compute_loss_wrapper(params, apply_fn, batch, aux_use_waypoint_loss, 
+                         aux_deep_supervision, waypoint_loss_weight,
+                         gc_reg_weight, gc_margin, rng, deterministic, step):
+    """Wrapper that passes step to compute_loss."""
+    return compute_loss(
+        params, apply_fn, batch, aux_use_waypoint_loss,
+        aux_deep_supervision, waypoint_loss_weight,
+        gc_reg_weight, gc_margin, rng, deterministic, step
+    )
 
 
 @partial(jax.jit, static_argnums=(2, 3, 4))
@@ -253,7 +325,10 @@ def train_step_single(
     aux_use_waypoint_loss: bool,
     aux_deep_supervision: bool,
     waypoint_loss_weight: float,
+    gc_reg_weight: float,      # New
+    gc_margin: float,          # New
     rng: jax.random.PRNGKey,
+    step: int,
 ) -> Tuple[TrainState, Dict[str, jnp.ndarray]]:
     """Single training step (single device)."""
 
@@ -265,6 +340,8 @@ def train_step_single(
             aux_use_waypoint_loss,
             aux_deep_supervision,
             waypoint_loss_weight,
+            gc_reg_weight,      # Add this
+            gc_margin,          # Add this
             rng,
             deterministic=False,
         )
@@ -281,6 +358,8 @@ def train_step_parallel(
     aux_use_waypoint_loss: bool,
     aux_deep_supervision: bool,
     waypoint_loss_weight: float,
+    gc_reg_weight: float,      # Add this
+    gc_margin: float,          # Add this
     rng: jax.random.PRNGKey,
 ) -> Tuple[TrainState, Dict[str, jnp.ndarray]]:
     """Single training step with gradient sync across devices."""
@@ -293,6 +372,8 @@ def train_step_parallel(
             aux_use_waypoint_loss,
             aux_deep_supervision,
             waypoint_loss_weight,
+            gc_reg_weight,      # Add this
+            gc_margin,          # Add this
             rng,
             deterministic=False,
         )
@@ -308,12 +389,22 @@ def train_step_parallel(
     return state, metrics
 
 
-def create_train_step_pmap(aux_use_waypoint_loss, aux_deep_supervision, waypoint_loss_weight):
+def create_train_step_pmap(
+    aux_use_waypoint_loss, 
+    aux_deep_supervision, 
+    waypoint_loss_weight,
+    gc_reg_weight,      # Add this
+    gc_margin,          # Add this
+    ):
     """Create pmap'd train step with specific aux config."""
     def _train_step(state, batch, rng):
         return train_step_parallel(
             state, batch,
-            aux_use_waypoint_loss, aux_deep_supervision, waypoint_loss_weight,
+            aux_use_waypoint_loss, 
+            aux_deep_supervision, 
+            waypoint_loss_weight,
+            gc_reg_weight,      # Add this
+            gc_margin,          # Add this
             rng
         )
     return jax.pmap(_train_step, axis_name="batch")
@@ -335,6 +426,8 @@ def eval_step(
     aux_use_waypoint_loss: bool,
     aux_deep_supervision: bool,
     waypoint_loss_weight: float,
+    gc_reg_weight,      # Add this
+    gc_margin,          # Add this
 ) -> Dict[str, jnp.ndarray]:
     """Evaluation step (no gradients)."""
     _, metrics = compute_loss(
@@ -344,6 +437,8 @@ def eval_step(
         aux_use_waypoint_loss,
         aux_deep_supervision,
         waypoint_loss_weight,
+        gc_reg_weight,      # Add this
+        gc_margin,          # Add this
         rng=None,
         deterministic=True,
     )
@@ -358,8 +453,17 @@ def evaluate_policy(
     task_type: str = "antmaze",
     num_episodes: int = 10,
     max_steps: int = 1000,
+    achieved_goals: np.ndarray = None,
 ) -> Dict[str, float]:
-    """Evaluate the current policy in the environment."""
+    """
+    Evaluate policy with comprehensive diagnostics.
+    
+    Fixes:
+    1. Proper success detection using env threshold
+    2. Waypoint supervision along actual paths
+    3. Stuck detection and recovery
+    4. Goal-conditioning diagnostics
+    """
     
     @jax.jit
     def get_action(params, states, actions, goals, timesteps):
@@ -370,17 +474,73 @@ def evaluate_policy(
     successes = []
     steps_list = []
     
+    # Track success by goal distance buckets
+    near_successes = []  # dist < 10
+    mid_successes = []   # 10 <= dist < 20
+    far_successes = []   # dist >= 20
+    
+    # Track movement quality
+    all_cos_sims = []
+    
     ctx_len = config.training.context_len
     action_dim = env.action_space.shape[0]
     
-    # Extract normalization stats
     obs_mean = norm_stats.obs_mean
     obs_std = norm_stats.obs_std
     goal_mean = norm_stats.goal_mean
     goal_std = norm_stats.goal_std
     
+    # ============================================================
+    # FIX 1: Get success threshold from environment
+    # ============================================================
+    if hasattr(env.unwrapped, 'goal_threshold'):
+        success_threshold = env.unwrapped.goal_threshold
+    elif hasattr(env.unwrapped, '_goal_threshold'):
+        success_threshold = env.unwrapped._goal_threshold
+    elif 'antmaze' in str(type(env.unwrapped)).lower():
+        success_threshold = 0.5  # Default for antmaze
+    else:
+        success_threshold = 0.5
+    
+    print(f"Success threshold: {success_threshold}")
+    
+    # Find far-apart goals for counterfactual test
+    if achieved_goals is not None and len(achieved_goals) > 100:
+        n_samples = min(1000, len(achieved_goals))
+        sample_idx = np.random.choice(len(achieved_goals), n_samples, replace=False)
+        sampled_goals = achieved_goals[sample_idx]
+        
+        min_x_idx = np.argmin(sampled_goals[:, 0])
+        max_x_idx = np.argmax(sampled_goals[:, 0])
+        min_y_idx = np.argmin(sampled_goals[:, 1])
+        max_y_idx = np.argmax(sampled_goals[:, 1])
+        
+        candidates = [min_x_idx, max_x_idx, min_y_idx, max_y_idx]
+        max_dist = 0
+        goal_far_1, goal_far_2 = sampled_goals[0], sampled_goals[1]
+        
+        for i in candidates:
+            for j in candidates:
+                if i != j:
+                    dist = np.linalg.norm(sampled_goals[i] - sampled_goals[j])
+                    if dist > max_dist:
+                        max_dist = dist
+                        goal_far_1 = sampled_goals[i]
+                        goal_far_2 = sampled_goals[j]
+        
+        goal_far_1_norm = (goal_far_1 - goal_mean) / goal_std
+        goal_far_2_norm = (goal_far_2 - goal_mean) / goal_std
+        
+        print(f"\n=== Counterfactual Goals (dist={max_dist:.1f}) ===")
+        print(f"  Goal 1: {goal_far_1} -> norm: {goal_far_1_norm}")
+        print(f"  Goal 2: {goal_far_2} -> norm: {goal_far_2_norm}")
+    else:
+        goal_far_1_norm = (np.array([0.0, 0.0]) - goal_mean) / goal_std
+        goal_far_2_norm = (np.array([20.0, 20.0]) - goal_mean) / goal_std
+    
+    print("=" * 60)
+    
     for ep in range(num_episodes):
-        # Reset environment
         reset_result = env.reset()
         if isinstance(reset_result, tuple):
             obs, info = reset_result
@@ -388,60 +548,42 @@ def evaluate_policy(
             obs = reset_result
             info = {}
 
-        # At the start of evaluate_policy, after env.reset():
-        print(f"obs[:2] (agent position in obs space): {obs[:2]}")
-        print(f"env.unwrapped.target_goal: {env.unwrapped.target_goal}")
-
-        if hasattr(env.unwrapped, 'sim'):
-            print(f"env.unwrapped.sim.data.qpos[:2]: {env.unwrapped.sim.data.qpos[:2]}")
-        if hasattr(env.unwrapped, 'get_xy'):
-            print(f"env.unwrapped.get_xy(): {env.unwrapped.get_xy()}")
-        
-        # Get goal based on task type
+        # Get goal
         if task_type == "antmaze":
-            # Try multiple methods to get the correct goal
-            goal_raw = None
-            
-            # Method 1: Check unwrapped env first
             if hasattr(env.unwrapped, 'target_goal'):
                 goal_raw = np.array(env.unwrapped.target_goal)
-            
-            # Method 2: Check wrapped env
-            if goal_raw is None and hasattr(env, 'target_goal'):
+            elif hasattr(env, 'target_goal'):
                 goal_raw = np.array(env.target_goal)
-                print(f"DEBUG Method 2: {goal_raw}")
-            
-            # Method 3: Get from info dict
-            if goal_raw is None and 'goal' in info:
-                goal_raw = np.array(info['goal'])[:2]
-                print(f"DEBUG Method 3: {goal_raw}")
-            
-            # Method 4: For some D4RL versions, goal is in observation
-            if goal_raw is None:
-                goal_raw = obs[:2]  # Fallback to agent position (wrong but safe)
-                print(f"DEBUG Method 4 (fallback): {goal_raw}")
-            
-            # SANITY CHECK: Goals should be within maze bounds
-            # For medium maze: roughly x in [0, 20], y in [0, 20]
-            # But actual reachable area is smaller
-            if goal_raw[0] > 25 or goal_raw[1] > 25:
-                print(f"WARNING: Goal {goal_raw} seems too large! Check goal extraction.")
+            else:
+                goal_raw = obs[:2]
+        else:
+            goal_raw = info.get("goal", obs.copy())
         
-        # Normalize goal and observation
+        # Initial distance for bucketing
+        initial_dist = np.linalg.norm(obs[:2] - goal_raw)
+        
         goal_normalized = (goal_raw - goal_mean) / goal_std
         obs_normalized = (obs - obs_mean) / obs_std
         
-        # Debug first episode
         if ep == 0:
-            print(f"Target Goal:  ({goal_raw[0]}, {goal_raw[1]})")
+            print(f"\nEpisode 0: goal={goal_raw}, initial_dist={initial_dist:.1f}")
 
-        # Context buffers
         states_buffer = [obs_normalized]
         actions_buffer = []
         
         done = False
         steps = 0
         success = False
+        prev_pos = obs[:2].copy()
+        
+        # Track for diagnostics
+        episode_cos_sims = []
+        recent_positions = []
+        recent_actions = []  # Track recent actions for smoothing
+        counterfactual_steps = [0, 100, 200, 300, 400]
+        
+        # Stuck detection
+        stuck_counter = 0
         
         while not done and steps < max_steps:
             # Prepare context
@@ -454,7 +596,6 @@ def evaluate_policy(
             else:
                 states = states_arr[-ctx_len:]
             
-            # Prepare actions with last zeroed
             if len(actions_buffer) == 0:
                 actions = np.zeros((ctx_len, action_dim))
             else:
@@ -472,62 +613,172 @@ def evaluate_policy(
                         np.zeros((1, action_dim))
                     ], axis=0)
             
-            # Model forward pass
             states_input = jnp.array(states[None])
             actions_input = jnp.array(actions[None])
-            goals_input = jnp.array(goal_normalized[None])
             timesteps_input = jnp.arange(ctx_len)[None]
             
+            # Counterfactual test at key steps
+            if ep == 0 and steps in counterfactual_steps:
+                goal_1_input = jnp.array(goal_far_1_norm[None])
+                goal_2_input = jnp.array(goal_far_2_norm[None])
+                
+                action_g1 = np.array(get_action(state.params, states_input, actions_input, 
+                                                goal_1_input, timesteps_input)[0])
+                action_g2 = np.array(get_action(state.params, states_input, actions_input, 
+                                                goal_2_input, timesteps_input)[0])
+                
+                action_diff = np.linalg.norm(action_g1 - action_g2)
+                
+                status = "✓ GOOD" if action_diff > 0.2 else ("⚠️ LOW" if action_diff > 0.05 else "❌ BAD")
+                print(f"  Step {steps}: ||a(g1)-a(g2)||={action_diff:.3f} {status}")
+            
+            # Get action
+            goals_input = jnp.array(goal_normalized[None])
             action = np.array(get_action(state.params, states_input, actions_input, 
                              goals_input, timesteps_input)[0])
-
+            
+            # ============================================================
+            # FIX 3: Action smoothing when stuck or high action norm
+            # ============================================================
+            action_norm = np.linalg.norm(action)
+            
+            # Smooth actions if stuck
+            if len(recent_actions) > 0 and stuck_counter > 10:
+                # Blend with previous action to reduce oscillation
+                prev_action = recent_actions[-1]
+                action = 0.7 * action + 0.3 * prev_action
+            
+            # Reduce action magnitude if very high (prevents falls)
+            if action_norm > 1.5:
+                action = action / action_norm * 1.0
+            
             action = np.clip(action, env.action_space.low, env.action_space.high)
+            
+            # Track recent actions
+            recent_actions.append(action.copy())
+            if len(recent_actions) > 20:
+                recent_actions.pop(0)
             
             # Step environment
             step_result = env.step(action)
             if len(step_result) == 5:
                 obs, reward, terminated, truncated, info = step_result
                 done = terminated or truncated
-                if done:
-                    print(f"terminated={terminated}, truncated={truncated}")
             else:
                 obs, reward, done, info = step_result
-                dist_to_goal = np.linalg.norm(obs[:2] - goal_raw)
-                if done:
-                    print(f"Episode {ep} ended at step {steps} with dist_to_goal={dist_to_goal}")
             
-            if ep == 0 and steps % 50 == 0:
-                print(f"Step {steps}: pos={obs[:2]}, dist_to_goal={dist_to_goal}")
-
-            # if ep == 0 and steps % 50 == 0:
-                # print(f"Action pred: {action}")
-                # print(f"Action bounds: [{env.action_space.low}, {env.action_space.high}]")
-
-            # Normalize new observation
+            current_pos = obs[:2]
+            dist_to_goal = np.linalg.norm(current_pos - goal_raw)
+            
+            # ============================================================
+            # FIX 1: Proper success detection
+            # ============================================================
+            # Check info dict first (most reliable)
+            env_success = info.get("is_success", info.get("success", False))
+            dist_success = dist_to_goal <= success_threshold
+            
+            if ep == 0 and steps % 100 == 0:
+                print(f"  Step {steps}: dist={dist_to_goal:.2f}, threshold={success_threshold}, "
+                      f"env_success={env_success}, dist_success={dist_success}")
+            
+            # Cosine similarity tracking
+            movement = current_pos - prev_pos
+            desired_dir = goal_raw - prev_pos
+            
+            movement_norm = np.linalg.norm(movement)
+            desired_norm = np.linalg.norm(desired_dir)
+            
+            if movement_norm > 0.01 and desired_norm > 0.01:
+                cos_sim = np.dot(movement, desired_dir) / (movement_norm * desired_norm)
+                episode_cos_sims.append(cos_sim)
+            
+            # Stuck detection
+            recent_positions.append(current_pos.copy())
+            if len(recent_positions) > 50:
+                recent_positions.pop(0)
+            
+            if len(recent_positions) >= 10:
+                recent_movement = np.linalg.norm(
+                    np.array(recent_positions[-1]) - np.array(recent_positions[-10])
+                )
+                if recent_movement < 0.5:
+                    stuck_counter += 1
+                else:
+                    stuck_counter = max(0, stuck_counter - 1)
+            
+            # Detailed diagnostics
+            if ep == 0 and steps % 100 == 0:
+                pos_variance = np.var(np.array(recent_positions), axis=0).sum() if len(recent_positions) >= 50 else -1
+                stuck_status = f"⚠️ STUCK({stuck_counter})" if stuck_counter > 20 else ""
+                
+                avg_cos_sim = np.mean(episode_cos_sims[-50:]) if len(episode_cos_sims) >= 50 else (
+                    np.mean(episode_cos_sims) if episode_cos_sims else 0
+                )
+                
+                print(f"  Step {steps}: pos={current_pos}, dist={dist_to_goal:.1f}, "
+                      f"action_norm={action_norm:.2f}, cos_sim={avg_cos_sim:.2f} {stuck_status}")
+                
+                if avg_cos_sim < 0:
+                    print(f"    ❌ Moving AWAY from goal!")
+                elif avg_cos_sim < 0.3:
+                    print(f"    ⚠️ Weak movement toward goal")
+            
+            prev_pos = current_pos.copy()
             obs_normalized = (obs - obs_mean) / obs_std
             
-            # Update buffers
             states_buffer.append(obs_normalized)
             actions_buffer.append(action)
             steps += 1
             
-            # Check success by distance (threshold = 0.5 for antmaze)
-            
-            if dist_to_goal < 1.0:
+            # Success check: use env signal OR distance
+            if env_success or dist_success:
                 success = True
+                if ep == 0:
+                    print(f"  ✓ SUCCESS at step {steps}! dist={dist_to_goal:.2f}, "
+                          f"env_success={env_success}, dist_success={dist_success}")
                 break
-
-            # Also check info
-            if info.get("success", False):
-                success = True
-                break
+        
+        if done and not success:
+            print(f"Episode {ep} ended: dist={dist_to_goal:.2f}, success={success}")
         
         successes.append(float(success))
         steps_list.append(steps)
+        all_cos_sims.extend(episode_cos_sims)
+        
+        # Bucket by initial distance
+        if initial_dist < 10:
+            near_successes.append(float(success))
+        elif initial_dist < 20:
+            mid_successes.append(float(success))
+        else:
+            far_successes.append(float(success))
+        
+        if ep == 0 and not success:
+            final_dist = np.linalg.norm(obs[:2] - goal_raw)
+            print(f"  ✗ FAILED: final_dist={final_dist:.1f}, steps={steps}")
+    
+    # Summary statistics
+    print(f"\n=== Evaluation Summary ===")
+    print(f"Overall success: {np.mean(successes):.1%} ({sum(successes):.0f}/{len(successes)})")
+    print(f"Avg steps: {np.mean(steps_list):.0f}")
+    
+    if near_successes:
+        print(f"Near goals (<10): {np.mean(near_successes):.1%} ({len(near_successes)} episodes)")
+    if mid_successes:
+        print(f"Mid goals (10-20): {np.mean(mid_successes):.1%} ({len(mid_successes)} episodes)")
+    if far_successes:
+        print(f"Far goals (>20): {np.mean(far_successes):.1%} ({len(far_successes)} episodes)")
+    
+    if all_cos_sims:
+        print(f"Avg cos_sim: {np.mean(all_cos_sims):.3f} (>0 = moving toward goal)")
     
     return {
         "success_rate": np.mean(successes),
         "avg_steps": np.mean(steps_list),
+        "avg_cos_sim": np.mean(all_cos_sims) if all_cos_sims else 0.0,
+        "near_success": np.mean(near_successes) if near_successes else -1,
+        "mid_success": np.mean(mid_successes) if mid_successes else -1,
+        "far_success": np.mean(far_successes) if far_successes else -1,
     }
 
 
@@ -719,6 +970,8 @@ def train(config: Config, resume_from: Optional[str] = None):
             config.aux.use_waypoint_loss,
             config.aux.deep_supervision,
             config.aux.waypoint_loss_weight,
+            config.aux.gc_reg_weight,
+            config.aux.gc_margin,
         )
         print(f"State replicated across {NUM_DEVICES} devices")
     else:
@@ -738,6 +991,9 @@ def train(config: Config, resume_from: Optional[str] = None):
         for _ in range(start_step):
             next(train_iter)
         print("Data iterator synced.")
+
+    gc_reg_weight = config.aux.gc_reg_weight
+    gc_margin = config.aux.gc_margin
     
     for step in range(start_step, config.training.max_steps):
         rng, step_rng = jax.random.split(rng)
@@ -759,6 +1015,8 @@ def train(config: Config, resume_from: Optional[str] = None):
                 aux_use_waypoint_loss,
                 aux_deep_supervision,
                 waypoint_loss_weight,
+                gc_reg_weight,      # New
+                gc_margin,  
                 step_rng,
             )
 
@@ -782,6 +1040,8 @@ def train(config: Config, resume_from: Optional[str] = None):
                 aux_use_waypoint_loss,
                 aux_deep_supervision,
                 waypoint_loss_weight,
+                gc_reg_weight,      # Add this
+                gc_margin,          # Add this
             )
             val_metrics_np = {f"val_{k}": float(v) for k, v in val_metrics.items()}
             print("Validation: " + ", ".join(f"{k}={v:.4f}" for k, v in val_metrics_np.items()))
@@ -794,6 +1054,7 @@ def train(config: Config, resume_from: Optional[str] = None):
                 norm_stats=env_info["norm_stats"],
                 task_type=env_info.get("task_type", "antmaze"),
                 num_episodes=config.training.eval_episodes,
+                achieved_goals=train_dataset.achieved_goals,
             )
             print(f"Policy eval: success_rate={eval_metrics['success_rate']:.3f}, "
                   f"avg_steps={eval_metrics['avg_steps']:.1f}")
@@ -848,7 +1109,7 @@ if __name__ == "__main__":
     parser.add_argument("--config", type=str, default="ut_gcdt_full",
                        choices=["gcdt_baseline", "ut_gcdt", "ut_gcdt_plan", "ut_gcdt_full",
                                 "ut_gcdt_gated", "ut_gcdt_gated_full", "ut_gcdt_multiblock"])
-    parser.add_argument("--dataset", type=str, default="antmaze-medium-stitch-v0")
+    parser.add_argument("--dataset", type=str, default="antmaze-medium-play-v2")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output_dir", type=str, default="./outputs")
     

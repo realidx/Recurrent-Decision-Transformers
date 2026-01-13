@@ -69,6 +69,10 @@ class TokenEmbedding(nn.Module):
         state_embed = nn.Dense(self.hidden_dim, name="state_embed")(states)
         action_embed = nn.Dense(self.hidden_dim, name="action_embed")(actions)
         goal_embed = nn.Dense(self.hidden_dim, name="goal_embed")(goals)  # (batch, hidden_dim)
+
+        goal_ctx = goal_embed[:, None, :]                # (batch, 1, hidden)
+        state_embed = state_embed + 0.1 * goal_ctx       # broadcast to (batch, seq, hidden)
+        action_embed = action_embed + 0.1 * goal_ctx
         
         # Positional embeddings
         pos_embed = self.param(

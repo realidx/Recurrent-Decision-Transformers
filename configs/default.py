@@ -14,7 +14,7 @@ class ModelConfig:
     # Transformer block
     num_heads: int = 4
     mlp_ratio: float = 4.0
-    dropout_rate: float = 0.1
+    dropout_rate: float = 0.01
 
     # For standard GCDT (untied) - V3 Protocol: L=12 layers
     num_layers: int = 12
@@ -40,7 +40,7 @@ class ModelConfig:
 
     # Plan token
     use_plan_token: bool = True
-    plan_token_bidirectional: bool = False
+    plan_token_bidirectional: bool = True
     plan_token_block_last_action: bool = True
     
     # Sequence modeling
@@ -52,8 +52,15 @@ class AuxiliaryConfig:
     """Auxiliary loss configuration."""
     # Waypoint prediction
     use_waypoint_loss: bool = True
-    waypoint_horizon: int = 10  # H steps ahead
+    waypoint_horizon: int = 20  # H steps ahead
     waypoint_loss_weight: float = 0.1
+
+    # NEW: Goal-conditioning regularizer
+    gc_reg_weight: float = 0.02  # Weight for goal-conditioning loss (0.01-0.05)
+    gc_margin: float = 0.3      # Margin for hinge loss (try 0.2-0.5)
+
+    directional_weight: float = 0.05
+    directional_margin: float = 0.3
     
     # Deep supervision: apply aux loss at each UT iteration
     deep_supervision: bool = True
@@ -64,24 +71,24 @@ class AuxiliaryConfig:
 class TrainingConfig:
     """Training configuration."""
     # Optimization
-    learning_rate: float = 0.0002
-    weight_decay: float = 0.1
-    warmup_steps: int = 1000
+    learning_rate: float = 0.0004
+    weight_decay: float = 0.01
+    warmup_steps: int = 2000
     max_steps: int = 100000
     
     # Batch size
     batch_size: int = 256
     
     # Context window for trajectory sampling
-    context_len: int = 20  # Number of (s, a) pairs in context
+    context_len: int = 50  # Number of (s, a) pairs in context
     
     # Evaluation
     eval_every: int = 10000
-    eval_episodes: int = 10
+    eval_episodes: int = 20
     
     # Logging
     log_every: int = 1000
-    save_every: int = 50000
+    save_every: int = 30000
     
     # Reproducibility
     seed: int = 42
@@ -107,11 +114,11 @@ class DataConfig:
     # Goal sampling strategy
     # "future": sample goals from future in same trajectory
     # "random": sample random goals from dataset
-    goal_sampling: str = "future"
+    goal_sampling: str = "her"
 
     # Future goal horizon range (for "future" sampling)
     min_goal_horizon: int = 1
-    max_goal_horizon: int = 50
+    max_goal_horizon: int = 200
 
     # Hindsight Experience Replay (HER) relabeling probability
     # 80% of time: use trajectory's FINAL achieved state as goal (enables stitching)

@@ -133,6 +133,56 @@ class D4RLDataset:
         # Build trajectory index for efficient sampling
         self._build_trajectory_index()
 
+    def _sample_goal_idx(self, rng, ctx_end, traj_end):
+        """
+        Goal sampling that forces goal-conditioning:
+        - Most of the time: pick a RANDOM future achieved goal (not always the final)
+        - Sometimes: pick the final achieved goal (keeps long-horizon signal)
+        - Use a mixture of short and long horizons to cover both local + global navigation
+        """
+        remaining = traj_end - ctx_end
+        if remaining <= self.min_goal_horizon:
+            return traj_end - 1
+
+        # Choose whether to use HER-like relabeling
+        use_her = (rng.random() < self.her_relabel_prob)
+
+        if use_her:
+            # IMPORTANT: do NOT always use traj_end-1
+            # Sample a random achieved goal later in the trajectory.
+            # Bias toward farther goals sometimes.
+            low = ctx_end + self.min_goal_horizon
+            high = traj_end  # exclusive
+            # 30%: far goal, 70%: anywhere future
+            if rng.random() < 0.30:
+                # far-biased: sample from last 30% of the future segment
+                far_low = low + int(0.70 * (high - low))
+                far_low = min(far_low, high - 1)
+                return rng.integers(far_low, high)
+            else:
+                return rng.integers(low, high)
+
+        # Non-HER: mixture of short + long horizons (log-uniform-ish)
+        max_h = min(self.max_goal_horizon, remaining - 1)
+        max_h = max(max_h, self.min_goal_horizon)
+
+        if rng.random() < 0.50:
+            # short horizon
+            h_low = self.min_goal_horizon
+            h_high = min(max_h, self.min_goal_horizon + 50)
+        else:
+            # long horizon
+            h_low = min(max_h, self.min_goal_horizon + 50)
+            h_high = max_h + 1
+
+        if h_high <= h_low:
+            goal_horizon = h_low
+        else:
+            goal_horizon = rng.integers(h_low, h_high)
+
+        return min(ctx_end + goal_horizon, traj_end - 1)
+
+
     def _compute_norm_stats(self) -> NormalizationStats:
         """Compute normalization statistics from data."""
         obs_mean = self.observations.mean(axis=0)
@@ -211,15 +261,11 @@ class D4RLDataset:
         """
         Sample a batch of trajectory contexts with goals.
         
-        FIXED: Actions are shifted by 1 to match inference
-        - action[t] = action taken AFTER state[t-1], or 0 for t=0
-        - This way, at every position t, the model sees (s_t, a_{t-1}) and predicts a_t
-        
-        Sequence structure:
-        Position:  0      1      2      ...   T-1
-        State:     s_0    s_1    s_2    ...   s_{T-1}
-        Action:    0      a_0    a_1    ...   a_{T-2}
-        Target:    a_{T-1}
+        Goal sampling strategy:
+        - HER (her_relabel_prob): Use achieved final state as goal
+        - Non-HER with far-bias:
+        - 30%: Sample from last 30% of remaining trajectory (far goals)
+        - 70%: Sample uniformly from future (any distance)
         """
         traj_indices = rng.choice(
             self.num_trajectories,
@@ -247,24 +293,18 @@ class D4RLDataset:
             ctx_end = min(ctx_start + self.context_len, traj_end - 1)
             actual_ctx_len = ctx_end - ctx_start
 
-            # States: s_0 to s_{T-1} (T = actual_ctx_len)
+            # States: s_0 to s_{T-1}
             states = self.observations[ctx_start:ctx_end]
             
-            # FIXED: Actions are SHIFTED by 1
-            # action[t] = a_{t-1} (action taken after seeing s_{t-1})
-            # action[0] = 0 (no previous action)
-            # action[T-1] = a_{T-2}
-            # Target = a_{T-1} (action to predict at s_{T-1})
-            
+            # Actions: shifted by 1 (action[t] = a_{t-1})
             actions = np.zeros((actual_ctx_len, self.action_dim))
             if actual_ctx_len > 1:
-                # Fill positions 1 to T-1 with actions a_0 to a_{T-2}
                 actions[1:] = self.actions[ctx_start:ctx_end - 1]
             
-            # Target: a_{T-1} - the action we should take at s_{T-1}
+            # Target: a_{T-1}
             target_action = self.actions[ctx_end - 1]
 
-            # Pad if needed (at beginning of context)
+            # Pad if needed
             if actual_ctx_len < self.context_len:
                 pad_len = self.context_len - actual_ctx_len
                 states = np.concatenate([
@@ -278,20 +318,10 @@ class D4RLDataset:
 
             timesteps = np.arange(self.context_len)
 
-            # Goal sampling with HER
-            use_her = rng.random() < self.her_relabel_prob
-            
-            if use_her:
-                goal_idx = traj_end - 1
-            else:
-                # FIX: Ensure valid range for rng.integers
-                remaining = traj_end - ctx_end
-                max_horizon = max(self.min_goal_horizon + 1, min(self.max_goal_horizon + 1, remaining))
-                if max_horizon <= self.min_goal_horizon:
-                    goal_horizon = self.min_goal_horizon
-                else:
-                    goal_horizon = rng.integers(self.min_goal_horizon, max_horizon)
-                goal_idx = min(ctx_end + goal_horizon, traj_end - 1)
+            # ============================================================
+            # GOAL SAMPLING (single source of truth)
+            # ============================================================
+            goal_idx = self._sample_goal_idx(rng, ctx_end, traj_end)
             
             # Extract goal
             if self.task_type == "antmaze":
@@ -299,8 +329,29 @@ class D4RLDataset:
             else:
                 goal = self.observations[goal_idx]
 
+
+            # ============================================================
+            # FIX 2: Waypoint should be ALONG THE PATH to the goal
+            # Not just any future point, but a point between current and goal
+            # that the trajectory actually passes through
+            # ============================================================
+            
+            # Compute waypoint as a fraction of the way to the goal
+            # This ensures the waypoint is on the actual path
+            steps_to_goal = goal_idx - ctx_end
+        
+            if steps_to_goal > self.waypoint_horizon:
+                # Waypoint is partway to the goal (e.g., 1/3 of the way)
+                waypoint_idx = ctx_end + min(self.waypoint_horizon, steps_to_goal // 3)
+            else:
+                # Goal is close, waypoint is just before it
+                waypoint_idx = ctx_end + max(1, steps_to_goal // 2)
+
+            remaining = traj_end - ctx_end
+
             # Future state for waypoint loss
-            waypoint_idx = min(ctx_end + self.waypoint_horizon, traj_end - 1)
+            effective_waypoint_horizon = min(self.waypoint_horizon, remaining - 1) if remaining > 1 else 0
+            waypoint_idx = min(ctx_end + effective_waypoint_horizon, traj_end - 1)
             future_state = self.observations[waypoint_idx]
 
             states_batch.append(states)
