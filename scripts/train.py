@@ -823,7 +823,7 @@ def train(config: Config, resume_from: Optional[str] = None):
     
     # Handle output directory for resume vs new training
     if resume_from:
-        output_dir = resume_from
+        output_dir = os.path.abspath(resume_from)
         print(f"\n=== Resuming training from {resume_from} ===")
         
         # Load config from checkpoint directory if exists
@@ -834,6 +834,7 @@ def train(config: Config, resume_from: Optional[str] = None):
     else:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         output_dir = os.path.join(config.output_dir, f"{config.exp_name}_{timestamp}")
+        output_dir = os.path.abspath(output_dir)
         os.makedirs(output_dir, exist_ok=True)
         
         # Save config
@@ -1148,7 +1149,11 @@ if __name__ == "__main__":
     config = config_map[args.config]()
     config.data.dataset_name = args.dataset
     config.training.seed = args.seed
-    config.output_dir = args.output_dir
+    config.output_dir = os.path.abspath(args.output_dir)
+
+    resume_path = None
+    if args.resume:
+        resume_path = os.path.abspath(args.resume)
 
     # Apply command-line overrides
     if args.max_steps is not None:
