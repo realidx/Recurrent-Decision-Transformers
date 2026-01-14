@@ -98,13 +98,12 @@ class TrainingConfig:
 class DataConfig:
     """Dataset configuration."""
     # Dataset type: "d4rl" or "ogbench"
-    dataset_type: str = "d4rl"
+    dataset_type: str = "ogbench"
 
-    # V3 Protocol D4RL datasets:
-    #   - Debug/Sanity: antmaze-umaze-v2 (target: >50% success)
-    #   - Primary (Stitching): antmaze-medium-play-v2 (target: beat baseline by >10%)
-    #   - Secondary: kitchen-mixed-v0 (long-horizon manipulation)
-    dataset_name: str = "antmaze-umaze-v2"
+    # OGBench AntMaze datasets (stitching-focused):
+    #   - Primary: antmaze-medium-stitch-v0
+    #   - Secondary: antmaze-large-stitch-v0
+    dataset_name: str = "antmaze-medium-stitch-v0"
 
     # For OGBench (legacy)
     dataset_dir: str = field(

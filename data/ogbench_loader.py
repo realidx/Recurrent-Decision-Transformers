@@ -18,6 +18,15 @@ class TrajectoryBatch:
     future_states: np.ndarray   # (batch, state_dim) - for waypoint loss
 
 
+@dataclass
+class NormalizationStats:
+    """Statistics for normalizing observations."""
+    obs_mean: np.ndarray
+    obs_std: np.ndarray
+    goal_mean: np.ndarray
+    goal_std: np.ndarray
+
+
 class OGBenchDataset:
     """
     Dataset wrapper for OGBench that provides trajectory sampling for GCDT.
@@ -37,6 +46,9 @@ class OGBenchDataset:
         min_goal_horizon: int = 1,
         max_goal_horizon: int = 50,
         waypoint_horizon: int = 10,
+        task_type: str = "antmaze",
+        normalize: bool = True,
+        norm_stats: Optional[NormalizationStats] = None,
     ):
         """
         Args:
@@ -57,9 +69,23 @@ class OGBenchDataset:
         self.min_goal_horizon = min_goal_horizon
         self.max_goal_horizon = max_goal_horizon
         self.waypoint_horizon = waypoint_horizon
+        self.task_type = task_type
+        self.normalize = normalize
         
         self.state_dim = self.observations.shape[-1]
         self.action_dim = self.actions.shape[-1]
+
+        if task_type == "antmaze":
+            self.goal_dim = 2
+            self.achieved_goals = self.observations[:, :2]
+        else:
+            self.goal_dim = self.state_dim
+            self.achieved_goals = self.observations
+
+        if normalize:
+            self.norm_stats = norm_stats or self._compute_norm_stats()
+        else:
+            self.norm_stats = None
         
         # Build trajectory index for efficient sampling
         self._build_trajectory_index()
@@ -86,7 +112,7 @@ class OGBenchDataset:
         self.trajectory_lengths = self.trajectory_ends - self.trajectory_starts
         
         # Filter out trajectories that are too short
-        min_len = self.context_len + self.max_goal_horizon
+        min_len = self.context_len + 1 + self.min_goal_horizon
         valid_trajs = self.trajectory_lengths >= min_len
         self.trajectory_starts = self.trajectory_starts[valid_trajs]
         self.trajectory_ends = self.trajectory_ends[valid_trajs]
@@ -101,6 +127,33 @@ class OGBenchDataset:
         print(f"Built trajectory index: {self.num_trajectories} valid trajectories")
         print(f"Trajectory length stats: min={self.trajectory_lengths.min()}, "
               f"max={self.trajectory_lengths.max()}, mean={self.trajectory_lengths.mean():.1f}")
+
+    def _compute_norm_stats(self) -> NormalizationStats:
+        """Compute normalization statistics from observations and achieved goals."""
+        obs_mean = self.observations.mean(axis=0)
+        obs_std = self.observations.std(axis=0) + 1e-6
+
+        goal_mean = self.achieved_goals.mean(axis=0)
+        goal_std = self.achieved_goals.std(axis=0) + 1e-6
+
+        return NormalizationStats(
+            obs_mean=obs_mean,
+            obs_std=obs_std,
+            goal_mean=goal_mean,
+            goal_std=goal_std,
+        )
+
+    def normalize_obs(self, obs: np.ndarray) -> np.ndarray:
+        """Normalize observations using stored statistics."""
+        if self.norm_stats is None:
+            return obs
+        return (obs - self.norm_stats.obs_mean) / self.norm_stats.obs_std
+
+    def normalize_goal(self, goal: np.ndarray) -> np.ndarray:
+        """Normalize goals using stored statistics."""
+        if self.norm_stats is None:
+            return goal
+        return (goal - self.norm_stats.goal_mean) / self.norm_stats.goal_std
     
     def sample_batch(self, batch_size: int, rng: np.random.Generator) -> TrajectoryBatch:
         """
@@ -135,20 +188,24 @@ class OGBenchDataset:
             traj_len = traj_end - traj_start
             
             # Sample starting point within trajectory
-            # Need room for context + goal horizon
-            max_start = traj_len - self.context_len - self.max_goal_horizon
+            # Need room for context + target action + goal horizon
+            max_start = max(0, traj_len - self.context_len - 1 - self.min_goal_horizon)
             start_offset = rng.integers(0, max_start + 1)
-            
+
             # Extract context
             ctx_start = traj_start + start_offset
             ctx_end = ctx_start + self.context_len
             
             states = self.observations[ctx_start:ctx_end]
-            actions = self.actions[ctx_start:ctx_end]
             timesteps = np.arange(self.context_len)
-            
-            # Target action is the last action in context (what we predict)
-            target_action = actions[-1]
+
+            # Actions are shifted by one to prevent leakage (last action zeroed)
+            actions = np.zeros((self.context_len, self.action_dim))
+            if self.context_len > 1:
+                actions[1:] = self.actions[ctx_start:ctx_end - 1]
+
+            # Target action is the action after the last state in context
+            target_action = self.actions[ctx_end - 1]
             
             # Sample goal from future in same trajectory
             if self.goal_sampling == "future":
@@ -157,15 +214,25 @@ class OGBenchDataset:
                     min(self.max_goal_horizon + 1, traj_end - ctx_end + 1)
                 )
                 goal_idx = ctx_end - 1 + goal_horizon  # -1 because ctx_end is exclusive
-                goal = self.observations[min(goal_idx, traj_end - 1)]
+                goal_full = self.observations[min(goal_idx, traj_end - 1)]
             else:
                 # Random goal from dataset
                 goal_idx = rng.integers(0, len(self.observations))
-                goal = self.observations[goal_idx]
+                goal_full = self.observations[goal_idx]
+
+            if self.task_type == "antmaze":
+                goal = goal_full[:2]
+            else:
+                goal = goal_full
             
             # Future state for waypoint loss
             waypoint_idx = min(ctx_end - 1 + self.waypoint_horizon, traj_end - 1)
             future_state = self.observations[waypoint_idx]
+
+            if self.normalize:
+                states = self.normalize_obs(states)
+                goal = self.normalize_goal(goal)
+                future_state = self.normalize_obs(future_state)
             
             states_batch.append(states)
             actions_batch.append(actions)
@@ -238,22 +305,31 @@ def load_ogbench_dataset(
     # Get dimensions from environment
     state_dim = env.observation_space.shape[0]
     action_dim = env.action_space.shape[0]
-    
+
+    task_type = "antmaze" if "antmaze" in dataset_name else "generic"
+    goal_dim = 2 if task_type == "antmaze" else state_dim
+
     train_dataset = OGBenchDataset(
         dataset=train_data,
         context_len=context_len,
+        task_type=task_type,
         **kwargs
     )
-    
+
     val_dataset = OGBenchDataset(
         dataset=val_data,
         context_len=context_len,
+        task_type=task_type,
+        norm_stats=train_dataset.norm_stats,
         **kwargs
     )
     
     env_info = {
         "state_dim": state_dim,
         "action_dim": action_dim,
+        "goal_dim": goal_dim,
+        "task_type": task_type,
+        "norm_stats": train_dataset.norm_stats,
         "env": env,
     }
     
