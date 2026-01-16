@@ -474,7 +474,8 @@ def _get_eval_goal(env, obs: np.ndarray, info: Dict[str, Any], task_type: str) -
     if task_type == "antmaze":
         for key in ("goal", "desired_goal", "target_goal"):
             if key in info:
-                return np.array(info[key])
+                goal = np.array(info[key])
+                return goal[:2] if goal.shape[0] >= 2 else goal
 
         for attr in ("target_goal", "goal"):
             if hasattr(env, attr):
