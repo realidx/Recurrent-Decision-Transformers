@@ -172,6 +172,8 @@ def compute_loss(
     waypoint_loss_weight: float,
     gc_reg_weight: float,
     gc_margin: float,
+    directional_weight: float,
+    directional_margin: float,
     rng: jax.random.PRNGKey,
     deterministic: bool = False,
     step: int = 0,  # NEW: current training step for adaptive weighting
@@ -230,26 +232,25 @@ def compute_loss(
         metrics["waypoint_loss"] = waypoint_loss
         total_loss = total_loss + waypoint_loss
         
-        # Directional waypoint loss
+        # Directional waypoint loss (weight can be zeroed for OGBench)
         current_xy = batch["states"][:, -1, :2]
         goal_xy = batch["goals"][:, :2]
         waypoint_pred_xy = waypoint_preds[-1][:, :2]
-        
+
         pred_delta = waypoint_pred_xy - current_xy
         desired_delta = goal_xy - current_xy
-        
+
         pred_delta_norm = pred_delta / (jnp.linalg.norm(pred_delta, axis=-1, keepdims=True) + 1e-8)
         desired_delta_norm = desired_delta / (jnp.linalg.norm(desired_delta, axis=-1, keepdims=True) + 1e-8)
-        
+
         cos_sim = jnp.sum(pred_delta_norm * desired_delta_norm, axis=-1)
-        
-        directional_margin = 0.3
+
         directional_loss = jnp.mean(jnp.maximum(0.0, directional_margin - cos_sim))
-        
-        directional_weight = 0.05
-        metrics["directional_loss"] = directional_loss
+        directional_loss_weighted = directional_weight * directional_loss
+
+        metrics["directional_loss"] = directional_loss_weighted
         metrics["waypoint_cos_sim"] = jnp.mean(cos_sim)
-        total_loss = total_loss + directional_weight * directional_loss
+        total_loss = total_loss + directional_loss_weighted
 
     # ============================================================
     # Goal-Conditioning Regularizer with Adaptive Weighting
@@ -309,12 +310,14 @@ def compute_loss(
 
 def compute_loss_wrapper(params, apply_fn, batch, aux_use_waypoint_loss, 
                          aux_deep_supervision, waypoint_loss_weight,
-                         gc_reg_weight, gc_margin, rng, deterministic, step):
+                         gc_reg_weight, gc_margin, directional_weight,
+                         directional_margin, rng, deterministic, step):
     """Wrapper that passes step to compute_loss."""
     return compute_loss(
         params, apply_fn, batch, aux_use_waypoint_loss,
         aux_deep_supervision, waypoint_loss_weight,
-        gc_reg_weight, gc_margin, rng, deterministic, step
+        gc_reg_weight, gc_margin, directional_weight, directional_margin,
+        rng, deterministic, step
     )
 
 
@@ -327,6 +330,8 @@ def train_step_single(
     waypoint_loss_weight: float,
     gc_reg_weight: float,      # New
     gc_margin: float,          # New
+    directional_weight: float,
+    directional_margin: float,
     rng: jax.random.PRNGKey,
     step: int,
 ) -> Tuple[TrainState, Dict[str, jnp.ndarray]]:
@@ -342,8 +347,11 @@ def train_step_single(
             waypoint_loss_weight,
             gc_reg_weight,      # Add this
             gc_margin,          # Add this
+            directional_weight,
+            directional_margin,
             rng,
             deterministic=False,
+            step=step,
         )
 
     (loss, metrics), grads = jax.value_and_grad(loss_fn, has_aux=True)(state.params)
@@ -360,7 +368,10 @@ def train_step_parallel(
     waypoint_loss_weight: float,
     gc_reg_weight: float,      # Add this
     gc_margin: float,          # Add this
+    directional_weight: float,
+    directional_margin: float,
     rng: jax.random.PRNGKey,
+    step: int,
 ) -> Tuple[TrainState, Dict[str, jnp.ndarray]]:
     """Single training step with gradient sync across devices."""
 
@@ -374,8 +385,11 @@ def train_step_parallel(
             waypoint_loss_weight,
             gc_reg_weight,      # Add this
             gc_margin,          # Add this
+            directional_weight,
+            directional_margin,
             rng,
             deterministic=False,
+            step=step,
         )
 
     (loss, metrics), grads = jax.value_and_grad(loss_fn, has_aux=True)(state.params)
@@ -395,9 +409,11 @@ def create_train_step_pmap(
     waypoint_loss_weight,
     gc_reg_weight,      # Add this
     gc_margin,          # Add this
+    directional_weight,
+    directional_margin,
     ):
     """Create pmap'd train step with specific aux config."""
-    def _train_step(state, batch, rng):
+    def _train_step(state, batch, rng, step):
         return train_step_parallel(
             state, batch,
             aux_use_waypoint_loss, 
@@ -405,9 +421,12 @@ def create_train_step_pmap(
             waypoint_loss_weight,
             gc_reg_weight,      # Add this
             gc_margin,          # Add this
-            rng
+            directional_weight,
+            directional_margin,
+            rng,
+            step,
         )
-    return jax.pmap(_train_step, axis_name="batch")
+    return jax.pmap(_train_step, axis_name="batch", in_axes=(0, 0, 0, None))
 
 
 def shard_batch(batch: Dict[str, jnp.ndarray], num_devices: int) -> Dict[str, jnp.ndarray]:
@@ -428,6 +447,8 @@ def eval_step(
     waypoint_loss_weight: float,
     gc_reg_weight,      # Add this
     gc_margin,          # Add this
+    directional_weight,
+    directional_margin,
 ) -> Dict[str, jnp.ndarray]:
     """Evaluation step (no gradients)."""
     _, metrics = compute_loss(
@@ -439,10 +460,43 @@ def eval_step(
         waypoint_loss_weight,
         gc_reg_weight,      # Add this
         gc_margin,          # Add this
+        directional_weight,
+        directional_margin,
         rng=None,
         deterministic=True,
     )
     return metrics
+
+
+def _get_eval_goal(env, obs: np.ndarray, info: Dict[str, Any], task_type: str) -> np.ndarray:
+    """Resolve evaluation goal with OGBench-friendly fallbacks."""
+    info = info or {}
+    if task_type == "antmaze":
+        for key in ("goal", "desired_goal", "target_goal"):
+            if key in info:
+                goal = np.array(info[key])
+                return goal[:2] if goal.shape[0] >= 2 else goal
+
+        for attr in ("target_goal", "goal"):
+            if hasattr(env, attr):
+                candidate = np.array(getattr(env, attr))
+                if candidate.shape[0] >= 2 and not np.allclose(candidate[:2], obs[:2]):
+                    return candidate[:2]
+            if hasattr(env.unwrapped, attr):
+                candidate = np.array(getattr(env.unwrapped, attr))
+                if candidate.shape[0] >= 2 and not np.allclose(candidate[:2], obs[:2]):
+                    return candidate[:2]
+
+        print("WARNING: Could not find target goal in env/info, using obs[:2].")
+        return obs[:2]
+
+    if "goal" in info:
+        return np.array(info["goal"])
+    if hasattr(env, "goal"):
+        return np.array(env.goal)
+    if hasattr(env.unwrapped, "goal"):
+        return np.array(env.unwrapped.goal)
+    return obs.copy()
 
 
 def evaluate_policy(
@@ -549,15 +603,7 @@ def evaluate_policy(
             info = {}
 
         # Get goal
-        if task_type == "antmaze":
-            if hasattr(env.unwrapped, 'target_goal'):
-                goal_raw = np.array(env.unwrapped.target_goal)
-            elif hasattr(env, 'target_goal'):
-                goal_raw = np.array(env.target_goal)
-            else:
-                goal_raw = obs[:2]
-        else:
-            goal_raw = info.get("goal", obs.copy())
+        goal_raw = _get_eval_goal(env, obs, info, task_type)
         
         # Initial distance for bucketing
         initial_dist = np.linalg.norm(obs[:2] - goal_raw)
@@ -849,6 +895,10 @@ def train(config: Config, resume_from: Optional[str] = None):
     print(f"Output directory: {output_dir}")
     print(f"Loading dataset: {config.data.dataset_name} (type: {config.data.dataset_type})")
 
+    if config.data.dataset_type == "ogbench" and config.data.goal_sampling == "her":
+        print("OGBench does not support HER goal sampling. Using future goals instead.")
+        config.data.goal_sampling = "future"
+
     # Load dataset
     if config.data.dataset_type == "d4rl":
         train_dataset, val_dataset, env_info = load_d4rl_dataset(
@@ -964,6 +1014,13 @@ def train(config: Config, resume_from: Optional[str] = None):
             rng, _ = jax.random.split(rng)
         print(f"Advanced RNG state to step {start_step}")
 
+    directional_weight = config.aux.directional_weight
+    directional_margin = config.aux.directional_margin
+    if config.data.dataset_type == "ogbench":
+        if directional_weight != 0.0:
+            print("Disabling directional waypoint loss for OGBench.")
+        directional_weight = 0.0
+
     # Multi-GPU: replicate state
     if use_multi_gpu:
         state = replicate(state)
@@ -973,6 +1030,8 @@ def train(config: Config, resume_from: Optional[str] = None):
             config.aux.waypoint_loss_weight,
             config.aux.gc_reg_weight,
             config.aux.gc_margin,
+            directional_weight,
+            directional_margin,
         )
         print(f"State replicated across {NUM_DEVICES} devices")
     else:
@@ -985,7 +1044,7 @@ def train(config: Config, resume_from: Optional[str] = None):
     aux_use_waypoint_loss = config.aux.use_waypoint_loss
     aux_deep_supervision = config.aux.deep_supervision
     waypoint_loss_weight = config.aux.waypoint_loss_weight
-    
+
     # Skip batches if resuming (to maintain data consistency)
     if start_step > 0:
         print(f"Skipping {start_step} batches to sync data iterator...")
@@ -1007,7 +1066,7 @@ def train(config: Config, resume_from: Optional[str] = None):
         if use_multi_gpu:
             batch = shard_batch(batch, NUM_DEVICES)
             step_rngs = jax.random.split(step_rng, NUM_DEVICES)
-            state, metrics = train_step_fn(state, batch, step_rngs)
+            state, metrics = train_step_fn(state, batch, step_rngs, step)
             metrics = {k: v[0] for k, v in metrics.items()}
         else:
             state, metrics = train_step_single(
@@ -1017,8 +1076,11 @@ def train(config: Config, resume_from: Optional[str] = None):
                 aux_deep_supervision,
                 waypoint_loss_weight,
                 gc_reg_weight,      # New
-                gc_margin,  
+                gc_margin,
+                directional_weight,
+                directional_margin,
                 step_rng,
+                step,
             )
 
         # Logging
@@ -1043,6 +1105,8 @@ def train(config: Config, resume_from: Optional[str] = None):
                 waypoint_loss_weight,
                 gc_reg_weight,      # Add this
                 gc_margin,          # Add this
+                directional_weight,
+                directional_margin,
             )
             val_metrics_np = {f"val_{k}": float(v) for k, v in val_metrics.items()}
             print("Validation: " + ", ".join(f"{k}={v:.4f}" for k, v in val_metrics_np.items()))
@@ -1110,7 +1174,8 @@ if __name__ == "__main__":
     parser.add_argument("--config", type=str, default="ut_gcdt_full",
                        choices=["gcdt_baseline", "ut_gcdt", "ut_gcdt_plan", "ut_gcdt_full",
                                 "ut_gcdt_gated", "ut_gcdt_gated_full", "ut_gcdt_multiblock"])
-    parser.add_argument("--dataset", type=str, default="antmaze-medium-play-v2")
+    parser.add_argument("--dataset", type=str, default="antmaze-medium-stitch-v0")
+    parser.add_argument("--dataset_type", type=str, default=None, choices=["d4rl", "ogbench"])
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output_dir", type=str, default="./outputs")
     
@@ -1148,6 +1213,8 @@ if __name__ == "__main__":
     
     config = config_map[args.config]()
     config.data.dataset_name = args.dataset
+    if args.dataset_type is not None:
+        config.data.dataset_type = args.dataset_type
     config.training.seed = args.seed
     config.output_dir = os.path.abspath(args.output_dir)
 

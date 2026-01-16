@@ -87,7 +87,7 @@ def evaluate_policy_fixed(
             info = {}
         
         # Get goal
-        goal_raw = _get_goal(env, obs, task_type)
+        goal_raw = _get_goal(env, obs, task_type, info)
         
         # CRITICAL FIX: Normalize goal
         goal_normalized = (goal_raw - goal_mean) / goal_std
@@ -194,31 +194,40 @@ def evaluate_policy_fixed(
     }
 
 
-def _get_goal(env, obs: np.ndarray, task_type: str) -> np.ndarray:
-    """Extract goal from environment."""
+def _get_goal(
+    env,
+    obs: np.ndarray,
+    task_type: str,
+    info: Optional[Dict[str, Any]] = None,
+) -> np.ndarray:
+    """Extract goal from environment with OGBench-aware fallbacks."""
+    info = info or {}
     if task_type == "antmaze":
-        # Try different ways to get the target goal
-        if hasattr(env, 'target_goal'):
-            return np.array(env.target_goal)
-        elif hasattr(env.unwrapped, 'target_goal'):
-            return np.array(env.unwrapped.target_goal)
-        elif hasattr(env, 'goal'):
-            return np.array(env.goal)
-        elif hasattr(env.unwrapped, 'goal'):
-            return np.array(env.unwrapped.goal)
-        else:
-            # Fallback: last 2 dims of observation (some antmaze versions)
-            # But this is usually the goal already embedded in obs
-            print("WARNING: Could not find target_goal, using obs[-2:]")
-            return obs[-2:]
-    elif task_type == "kitchen":
-        # Kitchen uses full state as goal
+        for key in ("goal", "desired_goal", "target_goal"):
+            if key in info:
+                goal = np.array(info[key])
+                return goal[:2] if goal.shape[0] >= 2 else goal
+
+        for attr in ("target_goal", "goal"):
+            if hasattr(env, attr):
+                candidate = np.array(getattr(env, attr))
+                if candidate.shape[0] >= 2 and not np.allclose(candidate[:2], obs[:2]):
+                    return candidate[:2]
+            if hasattr(env.unwrapped, attr):
+                candidate = np.array(getattr(env.unwrapped, attr))
+                if candidate.shape[0] >= 2 and not np.allclose(candidate[:2], obs[:2]):
+                    return candidate[:2]
+
+        # Fallback: last 2 dims of observation (some antmaze versions)
+        print("WARNING: Could not find target_goal, using obs[-2:]")
+        return obs[-2:]
+    if task_type == "kitchen":
+        if "goal" in info:
+            return np.array(info["goal"])
         if hasattr(env, 'goal'):
             return np.array(env.goal)
-        else:
-            return obs.copy()
-    else:
-        return obs[:2]
+        return obs.copy()
+    return obs[:2]
 
 
 def _prepare_context(
