@@ -246,10 +246,11 @@ def compute_loss(
         cos_sim = jnp.sum(pred_delta_norm * desired_delta_norm, axis=-1)
 
         directional_loss = jnp.mean(jnp.maximum(0.0, directional_margin - cos_sim))
+        directional_loss_weighted = directional_weight * directional_loss
 
-        metrics["directional_loss"] = directional_loss
+        metrics["directional_loss"] = directional_loss_weighted
         metrics["waypoint_cos_sim"] = jnp.mean(cos_sim)
-        total_loss = total_loss + directional_weight * directional_loss
+        total_loss = total_loss + directional_loss_weighted
 
     # ============================================================
     # Goal-Conditioning Regularizer with Adaptive Weighting
@@ -467,6 +468,36 @@ def eval_step(
     return metrics
 
 
+def _get_eval_goal(env, obs: np.ndarray, info: Dict[str, Any], task_type: str) -> np.ndarray:
+    """Resolve evaluation goal with OGBench-friendly fallbacks."""
+    info = info or {}
+    if task_type == "antmaze":
+        for key in ("goal", "desired_goal", "target_goal"):
+            if key in info:
+                return np.array(info[key])
+
+        for attr in ("target_goal", "goal"):
+            if hasattr(env, attr):
+                candidate = np.array(getattr(env, attr))
+                if candidate.shape[0] >= 2 and not np.allclose(candidate[:2], obs[:2]):
+                    return candidate[:2]
+            if hasattr(env.unwrapped, attr):
+                candidate = np.array(getattr(env.unwrapped, attr))
+                if candidate.shape[0] >= 2 and not np.allclose(candidate[:2], obs[:2]):
+                    return candidate[:2]
+
+        print("WARNING: Could not find target goal in env/info, using obs[:2].")
+        return obs[:2]
+
+    if "goal" in info:
+        return np.array(info["goal"])
+    if hasattr(env, "goal"):
+        return np.array(env.goal)
+    if hasattr(env.unwrapped, "goal"):
+        return np.array(env.unwrapped.goal)
+    return obs.copy()
+
+
 def evaluate_policy(
     state: TrainState,
     env,
@@ -571,15 +602,7 @@ def evaluate_policy(
             info = {}
 
         # Get goal
-        if task_type == "antmaze":
-            if hasattr(env.unwrapped, 'target_goal'):
-                goal_raw = np.array(env.unwrapped.target_goal)
-            elif hasattr(env, 'target_goal'):
-                goal_raw = np.array(env.target_goal)
-            else:
-                goal_raw = obs[:2]
-        else:
-            goal_raw = info.get("goal", obs.copy())
+        goal_raw = _get_eval_goal(env, obs, info, task_type)
         
         # Initial distance for bucketing
         initial_dist = np.linalg.norm(obs[:2] - goal_raw)
